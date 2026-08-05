@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from math import pi, cos, sin
 from typing import Optional
+from html import escape as html_escape
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -24,12 +25,16 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.enums import ChatMemberStatus
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters.callback_data import CallbackData
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # ---------- Настройки ----------
-TOKEN = "8342407843:AAGi_e-DmYarz8DsVWxqKs1O3xGS7mbh5Oo"
+TOKEN = "8668847269:AAFKRLhhy9bzeLtSGK12yKtyAdB63HsrKAo"
 CHANNEL_USERNAME = "@hp404faceit"
 GROUP_CHAT_ID = -1004345869414
+
+OWNER_ID = 6394456595
 
 TOPIC_LOBBY_5x5_1 = 18
 TOPIC_LOBBY_5x5_2 = 20
@@ -39,6 +44,7 @@ TOPIC_LOBBY_1x1_1 = 10
 TOPIC_LOBBY_1x1_2 = 2
 TOPIC_DRAW = 22
 TOPIC_RESULTS = 25
+TOPIC_TICKET = 43
 
 MAX_PLAYERS = {"5x5": 10, "2x2": 4, "1x1": 2}
 
@@ -53,16 +59,21 @@ MAP_URLS = {
 }
 map_images_cache = {}
 
-FONT_PATH = "Roboto-Regular.ttf"
-FALLBACK_FONT_URL = "https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Regular.ttf"
+FONT_PATH = "RussoOne-Regular.ttf"
+FONT_URL = "https://github.com/google/fonts/raw/main/ofl/russoone/RussoOne-Regular.ttf"
 
-FACEIT_ORANGE = (255, 85, 0)
-GOLD = (255, 215, 0)
-BG_DARK = (13, 14, 18)
-PANEL_DARK = (22, 24, 31)
-CARD_DARK = (28, 30, 38)
-TEXT_LIGHT = (230, 230, 235)
-TEXT_GRAY = (160, 165, 175)
+DEFAULT_BANNER_URL = "https://i.ibb.co/HfNZWCXB/default-banner.png"
+DEFAULT_BANNER_PATH = "default_banner.png"
+
+FACEIT_ORANGE = (255, 90, 0)
+GOLD = (255, 200, 0)
+DARK_BG = (10, 12, 18)
+PANEL_BG = (18, 22, 30)
+CARD_BG = (24, 28, 38)
+ACCENT_BLUE = (70, 140, 255)
+ACCENT_RED = (255, 70, 70)
+TEXT_WHITE = (240, 240, 245)
+TEXT_GRAY = (140, 150, 170)
 
 font_cache = {}
 def get_font(size):
@@ -125,9 +136,18 @@ def load_map_images():
 def download_font():
     if os.path.exists(FONT_PATH): return
     try:
-        r = requests.get(FALLBACK_FONT_URL, timeout=15)
+        r = requests.get(FONT_URL, timeout=15)
         if r.status_code == 200 and len(r.content) > 1000:
             with open(FONT_PATH, "wb") as f:
+                f.write(r.content)
+    except: pass
+
+def download_default_banner():
+    if os.path.exists(DEFAULT_BANNER_PATH): return
+    try:
+        r = requests.get(DEFAULT_BANNER_URL, timeout=15)
+        if r.status_code == 200 and len(r.content) > 1000:
+            with open(DEFAULT_BANNER_PATH, "wb") as f:
                 f.write(r.content)
     except: pass
 
@@ -140,10 +160,14 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT,
     nickname TEXT,
     standoff_id TEXT,
-    elo INTEGER DEFAULT 1000,
+    elo INTEGER DEFAULT 0,
+    wins INTEGER DEFAULT 0,
+    losses INTEGER DEFAULT 0,
     registered INTEGER DEFAULT 1,
     banned_until TEXT,
-    muted_until TEXT
+    muted_until TEXT,
+    premium INTEGER DEFAULT 0,
+    game_ban INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS lobbies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,7 +206,20 @@ CREATE TABLE IF NOT EXISTS duos (
     friend_nickname TEXT,
     PRIMARY KEY (user_id, friend_nickname)
 );
+CREATE TABLE IF NOT EXISTS player_maps (
+    user_id INTEGER,
+    map_name TEXT,
+    count INTEGER DEFAULT 1,
+    PRIMARY KEY (user_id, map_name)
+);
+CREATE TABLE IF NOT EXISTS duo_requests (
+    sender_id INTEGER,
+    receiver_id INTEGER,
+    PRIMARY KEY (sender_id, receiver_id)
+);
 """)
+conn.commit()
+c.execute("UPDATE users SET banned_until=NULL WHERE user_id=?", (OWNER_ID,))
 conn.commit()
 try: c.execute("ALTER TABLE lobbies ADD COLUMN map_name TEXT"); conn.commit()
 except: pass
@@ -193,6 +230,14 @@ except: pass
 try: c.execute("ALTER TABLE matches ADD COLUMN host_id INTEGER"); conn.commit()
 except: pass
 try: c.execute("ALTER TABLE matches ADD COLUMN score TEXT"); conn.commit()
+except: pass
+try: c.execute("ALTER TABLE users ADD COLUMN premium INTEGER DEFAULT 0"); conn.commit()
+except: pass
+try: c.execute("ALTER TABLE users ADD COLUMN wins INTEGER DEFAULT 0"); conn.commit()
+except: pass
+try: c.execute("ALTER TABLE users ADD COLUMN losses INTEGER DEFAULT 0"); conn.commit()
+except: pass
+try: c.execute("ALTER TABLE users ADD COLUMN game_ban INTEGER DEFAULT 0"); conn.commit()
 except: pass
 c.execute("INSERT OR IGNORE INTO admins (username) VALUES ('nelinner')")
 conn.commit()
@@ -219,15 +264,25 @@ def is_muted(user_id):
     row = c.fetchone()
     return row is not None and row[0] and datetime.fromisoformat(row[0]) > datetime.now()
 
+def is_game_banned(user_id):
+    c.execute("SELECT game_ban FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row and row[0] == 1
+
 def is_admin(username):
     if not username: return False
     c.execute("SELECT 1 FROM admins WHERE username=?", (username.lower().lstrip('@'),))
     return c.fetchone() is not None
 
+def is_premium(user_id):
+    c.execute("SELECT premium FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row and row[0] == 1
+
 def get_elo(user_id):
     c.execute("SELECT elo FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
-    return row[0] if row else 1000
+    return row[0] if row else 0
 
 def get_nickname(user_id):
     c.execute("SELECT nickname FROM users WHERE user_id=?", (user_id,))
@@ -238,6 +293,23 @@ def get_standoff_id(user_id):
     c.execute("SELECT standoff_id FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
     return row[0] if row else "0"
+
+def get_user_stats(user_id):
+    c.execute("SELECT elo, wins, losses FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return (row[0], row[1] if row[1] else 0, row[2] if row[2] else 0) if row else (0,0,0)
+
+def get_best_map(user_id):
+    c.execute("SELECT map_name FROM player_maps WHERE user_id=? ORDER BY count DESC LIMIT 1", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else None
+
+def increment_map_count(user_id, map_name):
+    if not map_name: return
+    c.execute("INSERT INTO player_maps (user_id, map_name, count) VALUES (?, ?, 1) "
+              "ON CONFLICT(user_id, map_name) DO UPDATE SET count = count + 1",
+              (user_id, map_name))
+    conn.commit()
 
 avatar_cache = {}
 banner_cache = {}
@@ -264,7 +336,13 @@ async def get_banner_cached(bot: Bot, user_id: int) -> Optional[Image.Image]:
     if bn:
         img = Image.open(bn).convert("RGBA")
     else:
-        img = None
+        if os.path.exists(DEFAULT_BANNER_PATH):
+            try:
+                img = Image.open(DEFAULT_BANNER_PATH).convert("RGBA")
+            except:
+                img = None
+        else:
+            img = None
     banner_cache[user_id] = img
     return img
 
@@ -305,19 +383,23 @@ async def get_custom_banner(bot: Bot, user_id: int) -> Optional[BytesIO]:
         except: pass
     return None
 
-# ---------- Профиль (баннер затемнён на 45%) ----------
+# ---------- Профиль ----------
 def generate_profile_card(user_id: int, username: Optional[str] = None,
                           cached_avatar: Optional[Image.Image] = None,
                           cached_banner: Optional[Image.Image] = None) -> BytesIO:
-    c.execute("SELECT nickname, standoff_id, elo FROM users WHERE user_id = ?", (user_id,))
+    elo, wins, losses = get_user_stats(user_id)
+    total = wins + losses
+    winrate = (wins / total * 100) if total > 0 else 0
+    best_map = get_best_map(user_id)
+    c.execute("SELECT nickname, standoff_id FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
-    if not row: row = ("Неизвестный", "0", 1000)
-    nickname, standoff_id, elo = row
+    if not row: row = ("Неизвестный", "0")
+    nickname, standoff_id = row
+    premium = is_premium(user_id)
 
-    w, h = 800, 450
+    w, h = 800, 480
     img = Image.new("RGBA", (w, h), (0,0,0,0))
     draw = ImageDraw.Draw(img)
-
     for y in range(h):
         ratio = y / h
         r = int(10 + 30 * ratio)
@@ -330,7 +412,6 @@ def generate_profile_card(user_id: int, username: Optional[str] = None,
     if cached_banner:
         try:
             banner_resized = cached_banner.resize((w-30, cell_h), Image.Resampling.LANCZOS)
-            # затемнение 45%
             dark = Image.new('RGBA', (w-30, cell_h), (0,0,0,115))
             banner_resized = Image.alpha_composite(banner_resized, dark)
             img.paste(banner_resized, (15, cell_y))
@@ -357,7 +438,7 @@ def generate_profile_card(user_id: int, username: Optional[str] = None,
     draw.text((avatar_x + avatar_size + 20, cell_y+30), nickname, font=font_nick, fill='white')
     draw.text((avatar_x + avatar_size + 20, cell_y+80), f"ID: {standoff_id}", font=font_id, fill=TEXT_GRAY)
     if username:
-        if username.lower() == "nelinner":
+        if user_id == OWNER_ID:
             badge = "OWNER"
             bg = (255,215,0)
             fg = (0,0,0)
@@ -365,6 +446,10 @@ def generate_profile_card(user_id: int, username: Optional[str] = None,
             badge = "ADMIN"
             bg = (200,0,0)
             fg = (255,255,255)
+        elif premium:
+            badge = "PREMIUM"
+            bg = (255,215,0)
+            fg = (0,0,0)
         else:
             badge = None
         if badge:
@@ -386,13 +471,22 @@ def generate_profile_card(user_id: int, username: Optional[str] = None,
         font_stat = ImageFont.load_default()
         font_small = ImageFont.load_default()
     draw.text((stat_x, stat_y), "Статистика", font=font_stat, fill='white')
-    draw.text((stat_x, stat_y+40), "Матчей сыграно: 0", font=font_small, fill=TEXT_GRAY)
-    draw.text((stat_x, stat_y+65), "Побед: 0", font=font_small, fill=TEXT_GRAY)
-    draw.text((stat_x, stat_y+90), "Поражений: 0", font=font_small, fill=TEXT_GRAY)
+    draw.text((stat_x, stat_y+40), f"Матчей сыграно: {total}", font=font_small, fill=TEXT_GRAY)
+    draw.text((stat_x, stat_y+65), f"Побед: {wins}", font=font_small, fill=TEXT_GRAY)
+    draw.text((stat_x, stat_y+90), f"Поражений: {losses}", font=font_small, fill=TEXT_GRAY)
 
-    if map_images_cache:
-        random_map = random.choice(list(map_images_cache.keys()))
-        map_img = map_images_cache[random_map].copy().resize((180, 100), Image.Resampling.LANCZOS)
+    bar_x = stat_x
+    bar_y = stat_y + 120
+    bar_w = 200
+    bar_h = 14
+    draw.rounded_rectangle([bar_x, bar_y, bar_x+bar_w, bar_y+bar_h], radius=7, fill=(60,60,70))
+    if winrate > 0:
+        fill_w = int(bar_w * winrate / 100)
+        draw.rounded_rectangle([bar_x, bar_y, bar_x+fill_w, bar_y+bar_h], radius=7, fill=FACEIT_ORANGE)
+    draw.text((bar_x+bar_w//2, bar_y+bar_h//2), f"{winrate:.1f}%", font=font_small, fill='white', anchor="mm")
+
+    if best_map and best_map in map_images_cache:
+        map_img = map_images_cache[best_map].copy().resize((180, 100), Image.Resampling.LANCZOS)
         map_x = w - 220
         map_y = stat_y
         draw.rounded_rectangle([map_x-8, map_y-8, map_x+188, map_y+108], radius=10, outline=FACEIT_ORANGE, width=3)
@@ -400,64 +494,57 @@ def generate_profile_card(user_id: int, username: Optional[str] = None,
             img.paste(map_img, (map_x, map_y), mask=map_img.split()[3])
         else:
             img.paste(map_img, (map_x, map_y))
-        draw.text((map_x+90, map_y+115), f"Best map: {random_map}", font=font_small, fill='white', anchor="mt")
+        draw.text((map_x+90, map_y+115), f"Best map: {best_map}", font=font_small, fill='white', anchor="mt")
 
     img = img.filter(ImageFilter.SHARPEN)
-
     bio = BytesIO()
     img.save(bio, format="PNG")
     bio.seek(0)
     return bio
 
-# ---------- Слот игрока (поддержка compact) ----------
+# ---------- Слот игрока ----------
 def draw_player_slot(draw, x, y, w, h, nickname, elo, sid, avatar=None, banner=None,
-                     is_owner=False, is_admin=False, compact=False):
+                     is_owner=False, is_admin=False, premium=False, compact=False):
     try:
         if compact:
-            # Уменьшенные размеры для жеребьёвки
             avatar_r = 40
             base_font_size = 30
             font_elo_size = 24
             font_id_size = 18
             font_badge_size = 14
-            overlay_h = 50
+            overlay_h = 40
             max_width_nick = w - 130
             text_y_nick = y + 16
-            text_y_elo = y + 52
-            text_y_id = y + 78
+            text_y_elo = y + 50
+            text_y_id = y + 74
         else:
             avatar_r = 54
             base_font_size = 38
             font_elo_size = 28
             font_id_size = 22
             font_badge_size = 16
-            overlay_h = 70
+            overlay_h = 50
             max_width_nick = w - 180
             text_y_nick = y + 22
-            text_y_elo = y + 70
-            text_y_id = y + 105
+            text_y_elo = y + 68
+            text_y_id = y + 100
 
         if banner:
             try:
                 bg_img = banner.resize((w, h), Image.Resampling.LANCZOS)
-                mask = Image.new('L', (w, h))
-                for my in range(h):
-                    alpha = int(180 * (my / h))
-                    for mx in range(w):
-                        mask.putpixel((mx, my), alpha)
-                black = Image.new('RGBA', (w, h), (0,0,0,255))
-                bg_img = Image.composite(black, bg_img, mask)
+                dark = Image.new('RGBA', (w, h), (0,0,0,153))
+                bg_img = Image.alpha_composite(bg_img, dark)
                 draw._image.paste(bg_img, (x, y))
             except:
                 draw.rounded_rectangle([x, y, x+w, y+h], radius=18, fill=(22,25,35), outline=(55,60,75), width=2)
         else:
             draw.rounded_rectangle([x, y, x+w, y+h], radius=18, fill=(22,25,35), outline=(55,60,75), width=2)
-        draw.rounded_rectangle([x+3, y+3, x+w-3, y+h-3], radius=16, outline=(255,160,50,75), width=5)
 
-        # Градиентный оверлей
+        draw.rounded_rectangle([x+3, y+3, x+w-3, y+h-3], radius=16, outline=(255,160,50,75), width=3)
+
         overlay = Image.new('RGBA', (w, overlay_h))
         for oy in range(overlay_h):
-            alpha = int(120 * (1 - oy / overlay_h))
+            alpha = int(40 * (1 - oy / overlay_h))
             for ox in range(w):
                 overlay.putpixel((ox, oy), (0,0,0,alpha))
         draw._image.paste(overlay, (x, y + h - overlay_h))
@@ -469,18 +556,14 @@ def draw_player_slot(draw, x, y, w, h, nickname, elo, sid, avatar=None, banner=N
             ImageDraw.Draw(mask).ellipse((0,0,avatar_r*2,avatar_r*2), fill=255)
             avatar_resized = avatar.resize((avatar_r*2, avatar_r*2), Image.Resampling.LANCZOS)
             draw._image.paste(avatar_resized, (avatar_cx-avatar_r, avatar_cy-avatar_r), mask)
-            draw.ellipse([avatar_cx-avatar_r-3, avatar_cy-avatar_r-3, avatar_cx+avatar_r+3, avatar_cy+avatar_r+3],
-                         outline=FACEIT_ORANGE, width=4)
+            draw.ellipse([avatar_cx-avatar_r-2, avatar_cy-avatar_r-2, avatar_cx+avatar_r+2, avatar_cy+avatar_r+2],
+                         outline=FACEIT_ORANGE, width=3)
         else:
             draw.ellipse([avatar_cx-avatar_r, avatar_cy-avatar_r, avatar_cx+avatar_r, avatar_cy+avatar_r],
-                         fill=(35,38,55), outline=FACEIT_ORANGE, width=5)
+                         fill=(35,38,55), outline=FACEIT_ORANGE, width=3)
 
         nick = nickname[:18]
         display_name = nick
-        if is_owner:
-            display_name = "👑 " + display_name
-        elif is_admin:
-            display_name = "🛡️ " + display_name
 
         font_size = base_font_size
         font_nick = get_font(font_size)
@@ -491,10 +574,13 @@ def draw_player_slot(draw, x, y, w, h, nickname, elo, sid, avatar=None, banner=N
             font_size -= 2
             font_nick = get_font(font_size)
 
-        if is_admin or is_owner:
-            badge_text = "OWNER" if is_owner else "ADMIN"
-            badge_bg = (255, 215, 0, 200) if is_owner else (200, 0, 0, 200)
-            badge_fg = (0, 0, 0) if is_owner else (255, 255, 255)
+        if is_admin or is_owner or premium:
+            badge_text = "OWNER" if is_owner else ("ADMIN" if is_admin else "PREMIUM")
+            badge_bg = (255, 215, 0, 200)
+            badge_fg = (0, 0, 0)
+            if is_admin and not is_owner:
+                badge_bg = (200, 0, 0, 200)
+                badge_fg = (255, 255, 255)
             font_badge = get_font(font_badge_size)
             nick_bbox = draw.textbbox((0,0), display_name, font=font_nick)
             nick_w = nick_bbox[2] - nick_bbox[0]
@@ -608,12 +694,22 @@ async def generate_lobby_image(bot: Bot, lobby_id: int) -> Optional[BytesIO]:
                 bn = banners[pid]
                 c.execute("SELECT username FROM users WHERE user_id=?", (pid,))
                 uname = c.fetchone()
-                is_own = uname and uname[0].lower() == "nelinner"
+                is_own = (pid == OWNER_ID)
                 is_adm = uname and is_admin(uname[0])
-                draw_player_slot(draw, x, y, slot_w, slot_h, nick, elo, sid, av, bn, is_own, is_adm)
+                premium = is_premium(pid)
+                draw_player_slot(draw, x, y, slot_w, slot_h, nick, elo, sid, av, bn, is_own, is_adm, premium)
             else:
                 draw.rounded_rectangle([x, y, x+slot_w, y+slot_h], radius=18, fill=(255,255,255,12), outline=(255,255,255,40))
-                draw.text((x+slot_w//2, y+slot_h//2-4), "WAITING FOR PLAYER...", font=get_font(35), fill='#666688', anchor='mm')
+                font_wait = get_font(32)
+                wait_text = "WAITING\nFOR PLAYER..."
+                lines = wait_text.split('\n')
+                line_h = font_wait.size * 1.2
+                total_h = len(lines) * line_h
+                cy = y + slot_h//2 - total_h//2
+                for idx, line in enumerate(lines):
+                    bbox = draw.textbbox((0,0), line, font=font_wait)
+                    lw = bbox[2]-bbox[0]
+                    draw.text((x+slot_w//2, cy + idx*line_h), line, font=font_wait, fill='#666688', anchor="ma")
 
         draw.text((width//2, height-38), "404hp FACEIT © 2026", font=get_font(32), fill='#777788', anchor='mt')
 
@@ -628,7 +724,7 @@ async def generate_lobby_image(bot: Bot, lobby_id: int) -> Optional[BytesIO]:
         logging.error(f"generate_lobby_image error: {e}")
         return None
 
-# ---------- Генератор жеребьёвки (с compact) ----------
+# ---------- Генератор жеребьёвки ----------
 async def generate_draft_image(bot, lobby_id, mode, ct_ids, t_ids, map_name, match_num, host_id):
     try:
         width, height = 1920, 1080
@@ -650,12 +746,12 @@ async def generate_draft_image(bot, lobby_id, mode, ct_ids, t_ids, map_name, mat
 
         ct_x, ct_y = 60, 140
         ct_w, ct_h = 520, 780
-        draw.rounded_rectangle([ct_x,ct_y,ct_x+ct_w,ct_y+ct_h], radius=16, fill=PANEL_DARK, outline=(88,160,255), width=4)
-        draw.text((ct_x+40,ct_y+20), "COUNTER-TERRORISTS", font=get_font(42), fill=(88,160,255))
+        draw.rounded_rectangle([ct_x,ct_y,ct_x+ct_w,ct_y+ct_h], radius=16, fill=PANEL_BG, outline=ACCENT_BLUE, width=4)
+        draw.text((ct_x+40,ct_y+20), "COUNTER-TERRORISTS", font=get_font(36), fill=ACCENT_BLUE)
 
         t_x = width - ct_w - 60
-        draw.rounded_rectangle([t_x,ct_y,t_x+ct_w,ct_y+ct_h], radius=16, fill=PANEL_DARK, outline=(255,140,50), width=4)
-        draw.text((t_x+40,ct_y+20), "TERRORISTS", font=get_font(42), fill=(255,140,50))
+        draw.rounded_rectangle([t_x,ct_y,t_x+ct_w,ct_y+ct_h], radius=16, fill=PANEL_BG, outline=ACCENT_RED, width=4)
+        draw.text((t_x+40,ct_y+20), "TERRORISTS", font=get_font(36), fill=ACCENT_RED)
 
         center_x = ct_x+ct_w+40
         center_w = t_x - (ct_x+ct_w) - 80
@@ -680,8 +776,8 @@ async def generate_draft_image(bot, lobby_id, mode, ct_ids, t_ids, map_name, mat
         total = max(ct_elo+t_elo, 1)
         ct_ratio = ct_elo/total
         bar_w = center_w-80
-        draw.rounded_rectangle([center_x+40,elo_y,center_x+40+int(bar_w*ct_ratio),elo_y+48], radius=8, fill=(88,160,255))
-        draw.rounded_rectangle([center_x+40+int(bar_w*ct_ratio),elo_y,center_x+center_w-40,elo_y+48], radius=8, fill=(255,140,50))
+        draw.rounded_rectangle([center_x+40,elo_y,center_x+40+int(bar_w*ct_ratio),elo_y+48], radius=8, fill=ACCENT_BLUE)
+        draw.rounded_rectangle([center_x+40+int(bar_w*ct_ratio),elo_y,center_x+center_w-40,elo_y+48], radius=8, fill=ACCENT_RED)
         draw.text((center_x+60,elo_y+8), str(ct_elo), font=get_font(42), fill='white')
         draw.text((center_x+center_w-60,elo_y+8), str(t_elo), font=get_font(42), fill='white', anchor="ra")
 
@@ -698,25 +794,27 @@ async def generate_draft_image(bot, lobby_id, mode, ct_ids, t_ids, map_name, mat
             y = slot_y + i * (slot_h + 10)
             c.execute("SELECT username FROM users WHERE user_id=?", (pid,))
             uname = c.fetchone()
-            is_own = uname and uname[0].lower() == "nelinner"
+            is_own = (pid == OWNER_ID)
             is_adm = uname and is_admin(uname[0])
+            premium = is_premium(pid)
             draw_player_slot(draw, ct_x+30, y, ct_w-60, slot_h,
                              get_nickname(pid), get_elo(pid), get_standoff_id(pid),
-                             avatars.get(pid), banners.get(pid), is_own, is_adm, compact=True)
+                             avatars.get(pid), banners.get(pid), is_own, is_adm, premium, compact=True)
 
         for i, pid in enumerate(t_ids[:5]):
             y = slot_y + i * (slot_h + 10)
             c.execute("SELECT username FROM users WHERE user_id=?", (pid,))
             uname = c.fetchone()
-            is_own = uname and uname[0].lower() == "nelinner"
+            is_own = (pid == OWNER_ID)
             is_adm = uname and is_admin(uname[0])
+            premium = is_premium(pid)
             draw_player_slot(draw, t_x+30, y, ct_w-60, slot_h,
                              get_nickname(pid), get_elo(pid), get_standoff_id(pid),
-                             avatars.get(pid), banners.get(pid), is_own, is_adm, compact=True)
+                             avatars.get(pid), banners.get(pid), is_own, is_adm, premium, compact=True)
 
         draw.text((width//2, height-50), "404hp FACEIT © 2026", font=get_font(32), fill=TEXT_GRAY, anchor="mm")
 
-        final_img = Image.new('RGB', (width, height), BG_DARK)
+        final_img = Image.new('RGB', (width, height), DARK_BG)
         final_img.paste(img, (0,0), img)
         final_img = final_img.filter(ImageFilter.SHARPEN)
         bio = BytesIO()
@@ -780,7 +878,7 @@ async def update_lobby_post(bot: Bot, lobby_id: int):
         msg = await bot.send_photo(GROUP_CHAT_ID, photo, caption=text, reply_markup=keyboard, message_thread_id=thread_id)
         c.execute("UPDATE lobbies SET message_id=? WHERE id=?", (msg.message_id, lobby_id)); conn.commit()
 
-# ---------- Жеребьёвка (дуо, правильный хост) ----------
+# ---------- Жеребьёвка с дуо ----------
 async def start_draw(bot: Bot, lobby_id: int, mode: str):
     c.execute("SELECT user_id FROM lobby_registrations WHERE lobby_id=?", (lobby_id,))
     players = [row[0] for row in c.fetchall()]
@@ -806,27 +904,63 @@ async def start_draw(bot: Bot, lobby_id: int, mode: str):
                 duo_pairs[pid] = friend_id
 
     random.shuffle(players)
-    half = len(players)//2
-    ct = players[:half]
-    t = players[half:]
 
-    if duo_pairs:
-        for p1, p2 in duo_pairs.items():
-            if (p1 in ct and p2 in t) or (p1 in t and p2 in ct):
-                if p1 in ct:
-                    for idx, p_other in enumerate(t):
-                        if p_other not in duo_pairs and p_other not in duo_pairs.values():
-                            ct[ct.index(p1)] = p_other
-                            t[idx] = p1
-                            break
-                else:
-                    for idx, p_other in enumerate(ct):
-                        if p_other not in duo_pairs and p_other not in duo_pairs.values():
-                            t[t.index(p1)] = p_other
-                            ct[idx] = p1
-                            break
-        ct = [p for p in players if p in ct]
-        t = [p for p in players if p in t]
+    if mode == "5x5" and len(duo_pairs) <= 2:
+        ct = []
+        t = []
+        used = set()
+        duo_list = list(duo_pairs.items())
+        if len(duo_list) >= 1:
+            p1, p2 = duo_list[0][0], duo_list[0][1]
+            ct.append(p1)
+            ct.append(p2)
+            used.add(p1)
+            used.add(p2)
+        if len(duo_list) >= 2:
+            p1, p2 = duo_list[1][0], duo_list[1][1]
+            t.append(p1)
+            t.append(p2)
+            used.add(p1)
+            used.add(p2)
+        remaining = [p for p in players if p not in used]
+        random.shuffle(remaining)
+        half = MAX_PLAYERS[mode] // 2
+        for p in remaining:
+            if len(ct) < half:
+                ct.append(p)
+            else:
+                t.append(p)
+        while len(ct) < half:
+            for p in players:
+                if p not in ct and p not in t:
+                    ct.append(p)
+                    break
+        while len(t) < half:
+            for p in players:
+                if p not in ct and p not in t:
+                    t.append(p)
+                    break
+    else:
+        half = len(players)//2
+        ct = players[:half]
+        t = players[half:]
+        if duo_pairs:
+            for p1, p2 in duo_pairs.items():
+                if (p1 in ct and p2 in ct) or (p1 in t and p2 in t):
+                    if p1 in ct:
+                        for idx, p_other in enumerate(t):
+                            if p_other not in duo_pairs and p_other not in duo_pairs.values():
+                                ct[ct.index(p1)] = p_other
+                                t[idx] = p1
+                                break
+                    else:
+                        for idx, p_other in enumerate(ct):
+                            if p_other not in duo_pairs and p_other not in duo_pairs.values():
+                                t[t.index(p1)] = p_other
+                                ct[idx] = p1
+                                break
+            ct = [p for p in players if p in ct]
+            t = [p for p in players if p in t]
 
     now = datetime.now().isoformat()
     c.execute("SELECT match_number, map_name FROM lobbies WHERE id=?", (lobby_id,))
@@ -870,11 +1004,20 @@ async def start_draw(bot: Bot, lobby_id: int, mode: str):
 # ---------- FSM ----------
 class RegStates(StatesGroup): nick = State(); sid = State(); confirm = State()
 class TicketStates(StatesGroup): waiting = State()
-class AdminStates(StatesGroup): waiting_add = State(); waiting_remove = State(); waiting_lobby_mode = State(); waiting_lobby_topic = State()
+class AdminStates(StatesGroup): waiting_add = State(); waiting_remove = State()
 class AvatarStates(StatesGroup): waiting_avatar = State()
 class BannerStates(StatesGroup): waiting_banner = State()
 class ResultStates(StatesGroup): waiting_screenshot = State(); waiting_score = State()
 class DuoStates(StatesGroup): waiting_nickname = State()
+class ManageAccountStates(StatesGroup): waiting_user = State(); waiting_action = State(); waiting_value = State()
+class ReportStates(StatesGroup):
+    waiting_target = State()
+    waiting_text = State()
+
+# ---------- CallbackData для кнопок репорта ----------
+class ReportAction(CallbackData, prefix="report"):
+    action: str
+    user_id: int
 
 # ---------- Главное меню ----------
 async def main_menu_keyboard(user_id, username):
@@ -891,12 +1034,28 @@ async def main_menu_keyboard(user_id, username):
 dp = Dispatcher(storage=MemoryStorage())
 bot = None
 
-# ---------- Хендлеры (полный комплект) ----------
+# Антиспам для репортов (не чаще раза в 60 секунд)
+last_report_time = {}
+
+def find_user(identifier: str):
+    """Возвращает user_id по @username или никнейму, либо None."""
+    if identifier.startswith("@"):
+        username = identifier.lstrip("@").lower()
+        c.execute("SELECT user_id FROM users WHERE username=?", (username,))
+    else:
+        c.execute("SELECT user_id FROM users WHERE nickname=?", (identifier,))
+    row = c.fetchone()
+    return row[0] if row else None
+
+# ---------- Хендлеры ----------
 @dp.message(Command("start"))
 async def start_cmd(message: Message, state: FSMContext):
     if not await check_subscription(bot, message.from_user.id):
         await message.answer(f"❌ Подпишитесь на {CHANNEL_USERNAME} и нажмите /start"); return
     if is_registered(message.from_user.id):
+        if is_banned(message.from_user.id):
+            await message.answer("❌ Вы забанены в боте.")
+            return
         await message.answer("Главное меню:", reply_markup=await main_menu_keyboard(message.from_user.id, message.from_user.username)); return
     await message.answer("Введите игровой никнейм из Standoff 2:"); await state.set_state(RegStates.nick)
 
@@ -918,7 +1077,7 @@ async def reg_sid(message: Message, state: FSMContext):
 async def reg_confirm(query: CallbackQuery, state: FSMContext):
     if query.data == "reg_confirm":
         user = query.from_user; data = await state.get_data()
-        c.execute("INSERT OR REPLACE INTO users (user_id, username, nickname, standoff_id, elo, registered) VALUES (?,?,?,?,1000,1)",
+        c.execute("INSERT OR REPLACE INTO users (user_id, username, nickname, standoff_id, elo, wins, losses, registered) VALUES (?,?,?,?,0,0,0,1)",
                   (user.id, user.username or "", data['nick'], data['sid']))
         conn.commit()
         await query.message.edit_text("Регистрация успешна! ✅")
@@ -930,24 +1089,31 @@ async def reg_confirm(query: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "menu_profile")
 async def profile(query: CallbackQuery, bot: Bot):
     if not is_registered(query.from_user.id): await query.answer("Сначала /start", show_alert=True); return
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     user_id = query.from_user.id; username = query.from_user.username
     nick = get_nickname(user_id); sid = get_standoff_id(user_id)
+    elo, wins, losses = get_user_stats(user_id)
+    total = wins + losses
+    winrate = (wins / total * 100) if total > 0 else 0
     info_text = (
-        "ℹ️ Информация об игроке:\n"
-        "——————\n"
-        f"👤 Nickname: {nick}\n"
-        f"🪪 ID: {sid}\n"
-        "——————\n"
-        "⚡ Сыгранно матчей: 0\n"
-        "🏆 Побед: 0"
+        f"ℹ️ Информация об игроке:\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"[👤] Nickname: {nick}\n"
+        f"[🪪] ID: {sid}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"[⚡] Сыграно матчей: {total}\n"
+        f"[🏆] Victory: {wins} ({winrate:.1f}%)\n"
+        f"[❌] Defeat: {losses}"
     )
     cached_av = await get_avatar_image_cached(bot, user_id)
     cached_bn = await get_banner_cached(bot, user_id)
     card = generate_profile_card(user_id, username=username, cached_avatar=cached_av, cached_banner=cached_bn)
     photo = BufferedInputFile(card.read(), filename="profile.png")
     profile_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏞️ Загрузить аватар", callback_data="set_avatar")],
-        [InlineKeyboardButton(text="🪪 Загрузить баннер", callback_data="set_banner")],
+        [InlineKeyboardButton(text="🏞️ Загрузить аватар", callback_data="set_avatar"),
+         InlineKeyboardButton(text="🪪 Загрузить баннер", callback_data="set_banner")],
+        [InlineKeyboardButton(text="🔄 Сбросить баннер", callback_data="reset_banner"),
+         InlineKeyboardButton(text="🔄 Сбросить аватарку", callback_data="reset_avatar")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")],
     ])
     await query.message.answer_photo(photo, caption=info_text, reply_markup=profile_kb)
@@ -955,10 +1121,12 @@ async def profile(query: CallbackQuery, bot: Bot):
 
 @dp.callback_query(F.data == "set_avatar")
 async def set_avatar_prompt(query: CallbackQuery, state: FSMContext):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     await query.message.delete(); await query.message.answer("Отправьте фотографию для аватарки:"); await state.set_state(AvatarStates.waiting_avatar)
 
 @dp.message(AvatarStates.waiting_avatar, F.photo)
 async def process_avatar(message: Message, state: FSMContext):
+    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     file_id = message.photo[-1].file_id
     c.execute("UPDATE users SET custom_avatar=? WHERE user_id=?", (file_id, message.from_user.id)); conn.commit()
     avatar_cache.pop(message.from_user.id, None)
@@ -966,18 +1134,35 @@ async def process_avatar(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "set_banner")
 async def set_banner_prompt(query: CallbackQuery, state: FSMContext):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     await query.message.delete(); await query.message.answer("Отправьте изображение для баннера ячейки:"); await state.set_state(BannerStates.waiting_banner)
 
 @dp.message(BannerStates.waiting_banner, F.photo)
 async def process_banner(message: Message, state: FSMContext):
+    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     file_id = message.photo[-1].file_id
     c.execute("UPDATE users SET custom_banner=? WHERE user_id=?", (file_id, message.from_user.id)); conn.commit()
     banner_cache.pop(message.from_user.id, None)
     await message.answer("Баннер обновлён!"); await state.clear()
 
+@dp.callback_query(F.data == "reset_banner")
+async def reset_banner(query: CallbackQuery):
+    c.execute("UPDATE users SET custom_banner=NULL WHERE user_id=?", (query.from_user.id,))
+    conn.commit()
+    banner_cache.pop(query.from_user.id, None)
+    await query.answer("Баннер сброшен.")
+
+@dp.callback_query(F.data == "reset_avatar")
+async def reset_avatar(query: CallbackQuery):
+    c.execute("UPDATE users SET custom_avatar=NULL WHERE user_id=?", (query.from_user.id,))
+    conn.commit()
+    avatar_cache.pop(query.from_user.id, None)
+    await query.answer("Аватарка сброшена.")
+
 # ---------- Поиск лобби ----------
 @dp.callback_query(F.data == "menu_search")
 async def search_mode_menu(query: CallbackQuery):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     await query.message.edit_text("Выберите режим для поиска лобби:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="5x5", callback_data="search_5x5")],
         [InlineKeyboardButton(text="2x2", callback_data="search_2x2")],
@@ -986,6 +1171,7 @@ async def search_mode_menu(query: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("search_"))
 async def show_lobbies_by_mode(query: CallbackQuery):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     mode = query.data.split("_")[1]
     c.execute("SELECT id, mode, thread_id FROM lobbies WHERE mode=?", (mode,))
     lobbies = c.fetchall()
@@ -1002,8 +1188,9 @@ async def show_lobbies_by_mode(query: CallbackQuery):
 @dp.callback_query(F.data.startswith("lobby_join_"))
 async def lobby_join(query: CallbackQuery, bot: Bot):
     user_id = query.from_user.id; lobby_id = int(query.data.split("_")[-1])
+    if is_banned(user_id): await query.answer("Вы забанены в боте.", show_alert=True); return
+    if is_game_banned(user_id): await query.answer("Вам запрещено участвовать в играх.", show_alert=True); return
     if not is_registered(user_id): await query.answer("Сначала /start"); return
-    if is_banned(user_id): await query.answer("Вы забанены."); return
     if is_muted(user_id): await query.answer("Вы замучены."); return
     c.execute("SELECT * FROM lobby_registrations WHERE lobby_id=? AND user_id=?", (lobby_id, user_id))
     if c.fetchone(): await query.answer("Вы уже в лобби."); return
@@ -1024,36 +1211,46 @@ async def lobby_join(query: CallbackQuery, bot: Bot):
 @dp.callback_query(F.data.startswith("lobby_leave_"))
 async def lobby_leave(query: CallbackQuery, bot: Bot):
     user_id = query.from_user.id; lobby_id = int(query.data.split("_")[-1])
+    if is_banned(user_id): await query.answer("Вы забанены в боте.", show_alert=True); return
     c.execute("DELETE FROM lobby_registrations WHERE lobby_id=? AND user_id=?", (lobby_id, user_id)); conn.commit()
     await query.answer("Вы вышли."); await update_lobby_post(bot, lobby_id)
 
 # ---------- Админ панель ----------
 @dp.callback_query(F.data == "menu_admin")
 async def admin_menu(query: CallbackQuery):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     if not is_admin(query.from_user.username): await query.answer("Нет доступа."); return
-    await query.message.edit_text("Админ панель:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_list")],
         [InlineKeyboardButton(text="🛡️ Управление админами", callback_data="admin_manage")],
         [InlineKeyboardButton(text="🎮 Управление лобби", callback_data="admin_lobbies")],
-        [InlineKeyboardButton(text="➕ Создать лобби", callback_data="admin_create_lobby")],
-        [InlineKeyboardButton(text="🗑 Сбросить ВСЕ лобби", callback_data="admin_reset_all_lobbies")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]]))
+        [InlineKeyboardButton(text="⚙️ Управление аккаунтом", callback_data="admin_manage_account")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")],
+    ])
+    if query.from_user.id == OWNER_ID:
+        keyboard.inline_keyboard.insert(3, [InlineKeyboardButton(text="🗑 Сбросить ВСЕ лобби", callback_data="admin_reset_all_lobbies")])
+    await query.message.edit_text("Админ панель:", reply_markup=keyboard)
 
 @dp.callback_query(F.data == "admin_reset_all_lobbies")
 async def admin_reset_all_lobbies(query: CallbackQuery, bot: Bot):
-    if not is_admin(query.from_user.username): await query.answer("Нет доступа."); return
-    c.execute("DELETE FROM lobby_registrations"); conn.commit()
-    c.execute("SELECT id FROM lobbies")
-    all_lobbies = [row[0] for row in c.fetchall()]
-    for lid in all_lobbies:
-        new_map = random.choice(list(map_images_cache.keys())) if map_images_cache else None
-        c.execute("UPDATE lobbies SET message_id=NULL, map_name=? WHERE id=?", (new_map, lid))
-    conn.commit()
-    await restore_all_lobby_posts()
-    await query.answer("Все лобби сброшены и пересозданы!")
+    if query.from_user.id != OWNER_ID: await query.answer("Нет доступа."); return
+    try:
+        c.execute("DELETE FROM lobby_registrations"); conn.commit()
+        c.execute("SELECT id FROM lobbies")
+        all_lobbies = [row[0] for row in c.fetchall()]
+        for lid in all_lobbies:
+            new_map = random.choice(list(map_images_cache.keys())) if map_images_cache else None
+            c.execute("UPDATE lobbies SET message_id=NULL, map_name=? WHERE id=?", (new_map, lid))
+        conn.commit()
+        await restore_all_lobby_posts()
+        await query.answer("Все лобби сброшены и пересозданы!")
+    except Exception as e:
+        logging.error(f"reset all lobbies error: {e}")
+        await query.answer("Произошла ошибка при сбросе.")
 
 @dp.callback_query(F.data == "admin_lobbies")
 async def admin_lobbies_list(query: CallbackQuery):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     c.execute("SELECT id, mode FROM lobbies"); lobbies = c.fetchall()
     buttons = [[InlineKeyboardButton(text=f"{m} лобби {lid}", callback_data=f"admin_lobby_{lid}")] for lid, m in lobbies]
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_admin")])
@@ -1061,6 +1258,7 @@ async def admin_lobbies_list(query: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("admin_lobby_"))
 async def admin_lobby_actions(query: CallbackQuery, bot: Bot):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     lobby_id = int(query.data.split("_")[-1])
     if not is_admin(query.from_user.username): await query.answer("Нет доступа."); return
     await query.message.edit_text(f"Действия с лобби {lobby_id}:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -1070,12 +1268,14 @@ async def admin_lobby_actions(query: CallbackQuery, bot: Bot):
 
 @dp.callback_query(F.data.startswith("admin_refresh_"))
 async def admin_refresh_lobby(query: CallbackQuery, bot: Bot):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     lobby_id = int(query.data.split("_")[-1])
     if not is_admin(query.from_user.username): await query.answer("Нет доступа."); return
     await update_lobby_post(bot, lobby_id); await query.answer("Лобби обновлено.")
 
 @dp.callback_query(F.data.startswith("admin_reset_"))
 async def admin_reset_lobby(query: CallbackQuery, bot: Bot):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     lobby_id = int(query.data.split("_")[-1])
     if not is_admin(query.from_user.username): await query.answer("Нет доступа."); return
     c.execute("DELETE FROM lobby_registrations WHERE lobby_id=?", (lobby_id,))
@@ -1084,32 +1284,10 @@ async def admin_reset_lobby(query: CallbackQuery, bot: Bot):
     conn.commit()
     await update_lobby_post(bot, lobby_id); await query.answer("Игроки сброшены, карта обновлена.")
 
-@dp.callback_query(F.data == "admin_create_lobby")
-async def admin_create_lobby_start(query: CallbackQuery, state: FSMContext):
-    if not is_admin(query.from_user.username): await query.answer("Нет доступа."); return
-    await query.message.edit_text("Введите режим (5x5, 2x2 или 1x1):",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="menu_admin")]]))
-    await state.set_state(AdminStates.waiting_lobby_mode)
-
-@dp.message(AdminStates.waiting_lobby_mode)
-async def admin_lobby_mode(message: Message, state: FSMContext):
-    mode = message.text.strip()
-    if mode not in MAX_PLAYERS: await message.answer("Неправильный режим."); return
-    await state.update_data(mode=mode); await message.answer("Теперь введите ID темы (целое число):")
-    await state.set_state(AdminStates.waiting_lobby_topic)
-
-@dp.message(AdminStates.waiting_lobby_topic)
-async def admin_lobby_topic(message: Message, state: FSMContext):
-    try: thread_id = int(message.text.strip())
-    except: await message.answer("Введите целое число."); return
-    data = await state.get_data(); mode = data['mode']
-    map_name = random.choice(list(map_images_cache.keys())) if map_images_cache else None
-    c.execute("INSERT OR IGNORE INTO lobbies (mode, thread_id, map_name) VALUES (?,?,?)", (mode, thread_id, map_name)); conn.commit()
-    await message.answer(f"Лобби {mode} в теме {thread_id} создано (карта: {map_name})!"); await state.clear()
-
 # ---------- Пользователи и баны ----------
 @dp.callback_query(F.data == "admin_list")
 async def admin_list(query: CallbackQuery):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     c.execute("SELECT user_id, nickname FROM users")
     users = c.fetchall()
     buttons = [[InlineKeyboardButton(text=f"{n} (ID:{uid})", callback_data=f"admin_user_{uid}")] for uid, n in users]
@@ -1118,41 +1296,45 @@ async def admin_list(query: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("admin_user_"))
 async def admin_user(query: CallbackQuery):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     uid = int(query.data.split("_")[-1])
-    c.execute("SELECT nickname, banned_until, muted_until FROM users WHERE user_id=?", (uid,))
+    c.execute("SELECT nickname, banned_until, muted_until, premium, game_ban FROM users WHERE user_id=?", (uid,))
     row = c.fetchone()
     if not row: await query.answer("Не найден."); return
-    nick, banned, muted = row
+    nick, banned, muted, premium, gban = row
     status = []
-    if banned and datetime.fromisoformat(banned) > datetime.now(): status.append("🔴 Забанен")
-    if muted and datetime.fromisoformat(muted) > datetime.now(): status.append("🔇 Замучен")
+    if banned and datetime.fromisoformat(banned) > datetime.now(): status.append("🔴 Забанен в боте")
+    if muted and datetime.fromisoformat(muted) > datetime.now(): status.append("🔇 Замучен в чате")
+    if premium: status.append("⭐ Premium")
+    if gban: status.append("🚫 Запрет на игры")
     status_str = "\n".join(status) if status else "✅ Активен"
     await query.message.edit_text(f"Пользователь: {nick} (ID: {uid})\n{status_str}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🚫 Забанить", callback_data=f"admin_ban_{uid}"),
-             InlineKeyboardButton(text="✅ Разбанить", callback_data=f"admin_unban_{uid}")],
-            [InlineKeyboardButton(text="🔇 Замутить", callback_data=f"admin_mute_{uid}"),
-             InlineKeyboardButton(text="🔈 Размутить", callback_data=f"admin_unmute_{uid}")],
+            [InlineKeyboardButton(text="🚫 Забанить в боте", callback_data=f"admin_ban_{uid}"),
+             InlineKeyboardButton(text="✅ Разбанить в боте", callback_data=f"admin_unban_{uid}")],
+            [InlineKeyboardButton(text="🔇 Замутить в чате", callback_data=f"admin_mute_{uid}"),
+             InlineKeyboardButton(text="🔈 Размутить в чате", callback_data=f"admin_unmute_{uid}")],
+            [InlineKeyboardButton(text="⭐ Выдать/убрать Premium", callback_data=f"admin_premium_{uid}")],
+            [InlineKeyboardButton(text="🚫 Запретить игры" if not gban else "✅ Разрешить игры", callback_data=f"admin_gameban_{uid}")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_list")]]))
 
 @dp.callback_query(F.data.startswith("admin_ban_"))
 async def admin_ban(query: CallbackQuery):
-    uid = int(query.data.split("_")[-1]); until = datetime.now() + timedelta(days=36500)
+    uid = int(query.data.split("_")[-1])
+    if uid == OWNER_ID:
+        await query.answer("❌ Нельзя забанить создателя.")
+        return
+    until = datetime.now() + timedelta(days=36500)
     c.execute("UPDATE users SET banned_until=? WHERE user_id=?", (until.isoformat(), uid)); conn.commit()
-    try: await bot.ban_chat_member(chat_id=GROUP_CHAT_ID, user_id=uid)
-    except: pass
-    await query.answer("Забанен."); await admin_user(query)
+    await query.answer("Пользователь забанен в боте.")
+    await admin_user(query)
 
 @dp.callback_query(F.data.startswith("admin_unban_"))
 async def admin_unban(query: CallbackQuery):
     uid = int(query.data.split("_")[-1])
     c.execute("UPDATE users SET banned_until=NULL WHERE user_id=?", (uid,)); conn.commit()
-    try:
-        await bot.unban_chat_member(chat_id=GROUP_CHAT_ID, user_id=uid)
-        await bot.restrict_chat_member(chat_id=GROUP_CHAT_ID, user_id=uid,
-                                       permissions=ChatPermissions(can_send_messages=True, can_send_other_messages=True))
-    except: pass
-    await query.answer("Разбанен."); await admin_user(query)
+    await query.answer("Пользователь разбанен в боте.")
+    await admin_user(query)
 
 @dp.callback_query(F.data.startswith("admin_mute_"))
 async def admin_mute(query: CallbackQuery):
@@ -1163,7 +1345,8 @@ async def admin_mute(query: CallbackQuery):
                                        permissions=ChatPermissions(can_send_messages=False, can_send_other_messages=False),
                                        until_date=until)
     except: pass
-    await query.answer("Замучен на 24 ч."); await admin_user(query)
+    await query.answer("Замучен в чате на 24 ч.")
+    await admin_user(query)
 
 @dp.callback_query(F.data.startswith("admin_unmute_"))
 async def admin_unmute(query: CallbackQuery):
@@ -1173,11 +1356,37 @@ async def admin_unmute(query: CallbackQuery):
         await bot.restrict_chat_member(chat_id=GROUP_CHAT_ID, user_id=uid,
                                        permissions=ChatPermissions(can_send_messages=True, can_send_other_messages=True))
     except: pass
-    await query.answer("Размучен."); await admin_user(query)
+    await query.answer("Размучен в чате.")
+    await admin_user(query)
+
+@dp.callback_query(F.data.startswith("admin_premium_"))
+async def admin_premium(query: CallbackQuery):
+    uid = int(query.data.split("_")[-1])
+    c.execute("SELECT premium FROM users WHERE user_id=?", (uid,))
+    row = c.fetchone()
+    current = row[0] if row else 0
+    new = 0 if current else 1
+    c.execute("UPDATE users SET premium=? WHERE user_id=?", (new, uid))
+    conn.commit()
+    await query.answer("Премиум выдан." if new else "Премиум убран.")
+    await admin_user(query)
+
+@dp.callback_query(F.data.startswith("admin_gameban_"))
+async def admin_gameban(query: CallbackQuery):
+    uid = int(query.data.split("_")[-1])
+    c.execute("SELECT game_ban FROM users WHERE user_id=?", (uid,))
+    row = c.fetchone()
+    current = row[0] if row else 0
+    new = 0 if current else 1
+    c.execute("UPDATE users SET game_ban=? WHERE user_id=?", (new, uid))
+    conn.commit()
+    await query.answer("Игры запрещены." if new else "Игры разрешены.")
+    await admin_user(query)
 
 # ---------- Управление админами ----------
 @dp.callback_query(F.data == "admin_manage")
 async def admin_manage_menu(query: CallbackQuery):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     c.execute("SELECT username FROM admins")
     admins = [row[0] for row in c.fetchall()]
     text = "Администраторы:\n" + "\n".join(f"• @{a}" for a in admins)
@@ -1188,18 +1397,21 @@ async def admin_manage_menu(query: CallbackQuery):
 
 @dp.callback_query(F.data == "admin_add")
 async def admin_add_prompt(query: CallbackQuery, state: FSMContext):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     await query.message.edit_text("Введите @username для добавления:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_manage")]]))
     await state.set_state(AdminStates.waiting_add)
 
 @dp.callback_query(F.data == "admin_remove")
 async def admin_remove_prompt(query: CallbackQuery, state: FSMContext):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     await query.message.edit_text("Введите @username для удаления:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_manage")]]))
     await state.set_state(AdminStates.waiting_remove)
 
 @dp.message(AdminStates.waiting_add)
 async def process_admin_add(message: Message, state: FSMContext):
+    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     raw = message.text.strip().lstrip('@').lower()
     if not raw: await message.answer("Некорректный username."); return
     c.execute("INSERT OR IGNORE INTO admins (username) VALUES (?)", (raw,)); conn.commit()
@@ -1207,6 +1419,7 @@ async def process_admin_add(message: Message, state: FSMContext):
 
 @dp.message(AdminStates.waiting_remove)
 async def process_admin_remove(message: Message, state: FSMContext):
+    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     raw = message.text.strip().lstrip('@').lower()
     if raw == "nelinner": await message.answer("❌ Нельзя удалить главного руководителя."); return
     if not raw: await message.answer("Некорректный username."); return
@@ -1216,6 +1429,7 @@ async def process_admin_remove(message: Message, state: FSMContext):
 # ---------- Лидерборд и тикеты ----------
 @dp.callback_query(F.data == "menu_leaderboard")
 async def leaderboard(query: CallbackQuery):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     c.execute("SELECT nickname, elo FROM users ORDER BY elo DESC LIMIT 10")
     rows = c.fetchall()
     text = "🏆 Лидерборд\n" + "\n".join(f"{i+1}. {r[0]} — {r[1]} ELO" for i, r in enumerate(rows)) if rows else "Пусто."
@@ -1224,12 +1438,14 @@ async def leaderboard(query: CallbackQuery):
 
 @dp.callback_query(F.data == "menu_ticket")
 async def ticket_start(query: CallbackQuery, state: FSMContext):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     await query.message.edit_text("Опишите проблему одним сообщением:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="menu_back")]]))
     await state.set_state(TicketStates.waiting)
 
 @dp.message(TicketStates.waiting)
 async def ticket_text(message: Message, state: FSMContext, bot: Bot):
+    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     user = message.from_user
     text = f"🎫 Тикет от {user.mention_html()} (ID: {user.id}):\n\n{message.text}"
     c.execute("SELECT username FROM admins")
@@ -1245,13 +1461,18 @@ async def ticket_text(message: Message, state: FSMContext, bot: Bot):
 @dp.callback_query(F.data == "menu_back")
 async def back_to_menu(query: CallbackQuery):
     try:
-        await query.message.delete()
-    except: pass
-    await query.message.answer("Главное меню:", reply_markup=await main_menu_keyboard(query.from_user.id, query.from_user.username))
+        await query.message.edit_text("Главное меню:", reply_markup=await main_menu_keyboard(query.from_user.id, query.from_user.username))
+    except:
+        try:
+            await query.message.delete()
+        except:
+            pass
+        await bot.send_message(chat_id=query.from_user.id, text="Главное меню:", reply_markup=await main_menu_keyboard(query.from_user.id, query.from_user.username))
 
 # ---------- /results ----------
 @dp.message(Command("results"))
 async def cmd_results(message: Message, state: FSMContext):
+    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     user_id = message.from_user.id
     c.execute("SELECT id, lobby_id, match_number FROM matches WHERE host_id=? AND status='drawn' ORDER BY created_at DESC LIMIT 1",
               (user_id,))
@@ -1266,6 +1487,7 @@ async def cmd_results(message: Message, state: FSMContext):
 
 @dp.message(ResultStates.waiting_screenshot, F.photo)
 async def results_screenshot(message: Message, state: FSMContext, bot: Bot):
+    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     file_id = message.photo[-1].file_id
     await state.update_data(screenshot_id=file_id)
     await message.answer("📃 Введите счет игры (например: 13 1)")
@@ -1273,6 +1495,7 @@ async def results_screenshot(message: Message, state: FSMContext, bot: Bot):
 
 @dp.message(ResultStates.waiting_score)
 async def results_score(message: Message, state: FSMContext, bot: Bot):
+    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     data = await state.get_data()
     match_id = data['match_id']
     lobby_id = data['lobby_id']
@@ -1287,11 +1510,25 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
         await message.answer("Неверный формат. Введите два числа через пробел, например: 13 1")
         return
 
-    # Обмен командами
-    c.execute("UPDATE match_players SET team='temp' WHERE match_id=?", (match_id,))
-    c.execute("UPDATE match_players SET team='CT' WHERE match_id=? AND team='T'", (match_id,))
-    c.execute("UPDATE match_players SET team='T' WHERE match_id=? AND team='temp'", (match_id,))
+    c.execute("SELECT map_name FROM lobbies WHERE id=?", (lobby_id,))
+    map_name = c.fetchone()[0]
+
+    c.execute("UPDATE match_players SET team = CASE team WHEN 'CT' THEN 'T' WHEN 'T' THEN 'CT' END WHERE match_id=?", (match_id,))
     c.execute("UPDATE matches SET score=?, status='finished' WHERE id=?", (f"{ct_score}-{t_score}", match_id))
+    conn.commit()
+
+    c.execute("SELECT user_id, team FROM match_players WHERE match_id=?", (match_id,))
+    players = c.fetchall()
+    for uid, team in players:
+        is_winner = (team == 'CT' and ct_score > t_score) or (team == 'T' and t_score > ct_score)
+        premium = is_premium(uid)
+        delta = (50 if premium else 25) if is_winner else (-15 if premium else -10)
+        new_elo = max(0, get_elo(uid) + delta)
+        if is_winner:
+            c.execute("UPDATE users SET wins = wins + 1, elo = ? WHERE user_id=?", (new_elo, uid))
+        else:
+            c.execute("UPDATE users SET losses = losses + 1, elo = ? WHERE user_id=?", (new_elo, uid))
+        increment_map_count(uid, map_name)
     conn.commit()
 
     c.execute("SELECT mode, map_name FROM lobbies WHERE id=?", (lobby_id,))
@@ -1336,12 +1573,14 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
 
 # ---------- /playduo ----------
 @dp.message(Command("playduo"))
-async def cmd_playduo(message: Message, state: FSMContext):
+async def cmd_playduo(message: Message, state: FSMContext, bot: Bot):
+    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     await message.answer("[👤] Отправьте nickname друга, с которым вы хотите быть в одной команде:")
     await state.set_state(DuoStates.waiting_nickname)
 
 @dp.message(DuoStates.waiting_nickname)
-async def duo_nickname(message: Message, state: FSMContext):
+async def duo_nickname(message: Message, state: FSMContext, bot: Bot):
+    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     friend_nick = message.text.strip()
     if not friend_nick:
         await message.answer("Никнейм не может быть пустым.")
@@ -1358,9 +1597,340 @@ async def duo_nickname(message: Message, state: FSMContext):
         await message.answer("Нельзя добавить себя в дуо.")
         await state.clear()
         return
-    c.execute("INSERT OR REPLACE INTO duos (user_id, friend_nickname) VALUES (?, ?)", (user_id, friend_nick))
+
+    if not is_registered(friend_id):
+        await message.answer("Пользователь ещё не зарегистрирован в боте. Ему нужно написать /start.")
+        await state.clear()
+        return
+
+    c.execute("INSERT OR REPLACE INTO duo_requests (sender_id, receiver_id) VALUES (?, ?)", (user_id, friend_id))
     conn.commit()
-    await message.answer(f"✅ Теперь вы находитесь в DUO режиме с игроком {friend_nick}.")
+
+    sender_nick = get_nickname(user_id)
+    try:
+        await bot.send_message(
+            friend_id,
+            f"💌 Игрок {sender_nick} хочет быть с вами в DUO.\n"
+            f"Примите или отклоните запрос:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Принять", callback_data=f"duo_accept_{user_id}")],
+                [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"duo_decline_{user_id}")],
+            ])
+        )
+        await message.answer(f"Запрос отправлен игроку {friend_nick}.")
+    except Exception as e:
+        await message.answer("Не удалось отправить запрос. Убедитесь, что пользователь начал диалог с ботом.")
+        logging.error(f"Ошибка отправки дуо-запроса: {e}")
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("duo_accept_"))
+async def duo_accept(query: CallbackQuery, bot: Bot):
+    sender_id = int(query.data.split("_")[-1])
+    receiver_id = query.from_user.id
+    c.execute("SELECT * FROM duo_requests WHERE sender_id=? AND receiver_id=?", (sender_id, receiver_id))
+    if not c.fetchone():
+        await query.answer("Запрос уже недействителен.")
+        return
+
+    sender_nick = get_nickname(sender_id)
+    receiver_nick = get_nickname(receiver_id)
+    c.execute("INSERT OR REPLACE INTO duos (user_id, friend_nickname) VALUES (?, ?)", (sender_id, receiver_nick))
+    c.execute("INSERT OR REPLACE INTO duos (user_id, friend_nickname) VALUES (?, ?)", (receiver_id, sender_nick))
+    conn.commit()
+
+    c.execute("DELETE FROM duo_requests WHERE sender_id=? AND receiver_id=?", (sender_id, receiver_id))
+    conn.commit()
+
+    await query.message.edit_text(f"✅ Вы приняли запрос на DUO с игроком {sender_nick}.")
+    await bot.send_message(sender_id, f"✅ {receiver_nick} принял ваш запрос на DUO!")
+
+@dp.callback_query(F.data.startswith("duo_decline_"))
+async def duo_decline(query: CallbackQuery, bot: Bot):
+    sender_id = int(query.data.split("_")[-1])
+    receiver_id = query.from_user.id
+    c.execute("DELETE FROM duo_requests WHERE sender_id=? AND receiver_id=?", (sender_id, receiver_id))
+    conn.commit()
+    await query.message.edit_text("❌ Вы отклонили запрос на DUO.")
+    await bot.send_message(sender_id, f"❌ Игрок отказался от дуо.")
+
+# ---------- /report (исправленный FSM с защитами) ----------
+@dp.message(Command("report"))
+async def cmd_report(message: Message, state: FSMContext):
+    if is_banned(message.from_user.id):
+        await message.answer("Вы забанены в боте.")
+        return
+
+    # Антиспам
+    user_id = message.from_user.id
+    now = datetime.now()
+    if user_id in last_report_time:
+        elapsed = (now - last_report_time[user_id]).total_seconds()
+        if elapsed < 60:
+            await message.answer("❌ Пожалуйста, подождите перед следующей жалобой.")
+            return
+    last_report_time[user_id] = now
+
+    await state.clear()
+
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+        if target_id == user_id:
+            await message.answer("❌ Нельзя отправить жалобу на самого себя.")
+            return
+        await state.update_data(target_id=target_id)
+        await message.answer("📃 Введите текст жалобы:")
+        await state.set_state(ReportStates.waiting_text)
+        return
+
+    args = message.text.strip().split(maxsplit=1)
+    if len(args) > 1:
+        identifier = args[1].strip()
+        target_id = find_user(identifier)
+        if not target_id:
+            await message.answer("❌ Пользователь не найден.")
+            return
+        if target_id == user_id:
+            await message.answer("❌ Нельзя отправить жалобу на самого себя.")
+            return
+        await state.update_data(target_id=target_id)
+        await message.answer("📃 Введите текст жалобы:")
+        await state.set_state(ReportStates.waiting_text)
+        return
+
+    await message.answer("👤 Введите @username или nickname нарушителя:")
+    await state.set_state(ReportStates.waiting_target)
+
+@dp.message(ReportStates.waiting_target)
+async def process_report_target(message: Message, state: FSMContext):
+    identifier = message.text.strip()
+    target_id = find_user(identifier)
+    if not target_id:
+        await message.answer("❌ Пользователь не найден. Попробуйте ещё раз или нажмите /start для отмены.")
+        return
+    if target_id == message.from_user.id:
+        await message.answer("❌ Нельзя отправить жалобу на самого себя.")
+        return
+    await state.update_data(target_id=target_id)
+    await message.answer("📃 Введите текст жалобы:")
+    await state.set_state(ReportStates.waiting_text)
+
+@dp.message(ReportStates.waiting_text)
+async def process_report_text(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    target_id = data.get("target_id")
+    if not target_id:
+        await message.answer("Ошибка: цель не найдена. Начните заново с /report.")
+        await state.clear()
+        return
+
+    try:
+        target_chat = await bot.get_chat(target_id)
+        target_username = f"@{target_chat.username}" if target_chat.username else f"ID {target_chat.id}"
+    except Exception as e:
+        logging.error(f"get_chat error: {e}")
+        target_username = f"ID {target_id}"
+
+    from_user = message.from_user
+    from_username = f"@{from_user.username}" if from_user.username else f"ID {from_user.id}"
+
+    report_text = (
+        "🚨 <b>Новая жалоба</b>\n\n"
+        f"👤 <b>От:</b> {html_escape(from_username)}\n"
+        f"🎯 <b>На:</b> {html_escape(target_username)}\n\n"
+        f"📝 <b>Текст:</b>\n"
+        f"{html_escape(message.text)}"
+    )
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🚫 Забанить", callback_data=ReportAction(action="ban", user_id=target_id))
+    builder.button(text="✅ Разбанить", callback_data=ReportAction(action="unban", user_id=target_id))
+    builder.button(text="🔇 Замутить", callback_data=ReportAction(action="mute", user_id=target_id))
+    builder.button(text="🔈 Размутить", callback_data=ReportAction(action="unmute", user_id=target_id))
+    builder.button(text="❌ Отменить репорт", callback_data=ReportAction(action="cancel", user_id=target_id))
+    builder.adjust(2, 2, 1)
+
+    await bot.send_message(
+        GROUP_CHAT_ID,
+        report_text,
+        parse_mode="HTML",
+        reply_markup=builder.as_markup(),
+        message_thread_id=TOPIC_TICKET
+    )
+    await message.answer("✅ Репорт отправлен в тикет поддержки.")
+    await state.clear()
+
+@dp.callback_query(ReportAction.filter())
+async def report_action(query: CallbackQuery, callback_data: ReportAction, bot: Bot):
+    # Проверяем права (администратор группы или создатель)
+    try:
+        member = await bot.get_chat_member(GROUP_CHAT_ID, query.from_user.id)
+        if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+            await query.answer("❌ У вас нет прав для выполнения этого действия.", show_alert=True)
+            return
+    except Exception as e:
+        logging.error(f"Ошибка проверки прав: {e}")
+        await query.answer("⚠️ Не удалось проверить права.")
+        return
+
+    action = callback_data.action
+    uid = callback_data.user_id
+
+    if action == "ban":
+        if uid == OWNER_ID:
+            await query.answer("❌ Нельзя забанить создателя.")
+            return
+        until = datetime.now() + timedelta(days=36500)
+        c.execute("UPDATE users SET banned_until=? WHERE user_id=?", (until.isoformat(), uid))
+        conn.commit()
+        try:
+            await bot.ban_chat_member(chat_id=GROUP_CHAT_ID, user_id=uid)
+        except Exception as e:
+            logging.error(f"Ban error: {e}")
+        await query.answer("Пользователь забанен.")
+    elif action == "unban":
+        c.execute("UPDATE users SET banned_until=NULL WHERE user_id=?", (uid,))
+        conn.commit()
+        try:
+            await bot.unban_chat_member(chat_id=GROUP_CHAT_ID, user_id=uid)
+            await bot.restrict_chat_member(chat_id=GROUP_CHAT_ID, user_id=uid,
+                                           permissions=ChatPermissions(can_send_messages=True, can_send_other_messages=True))
+        except Exception as e:
+            logging.error(f"Unban error: {e}")
+        await query.answer("Пользователь разбанен.")
+    elif action == "mute":
+        if uid == OWNER_ID:
+            await query.answer("❌ Нельзя замутить создателя.")
+            return
+        until = datetime.now() + timedelta(hours=24)
+        c.execute("UPDATE users SET muted_until=? WHERE user_id=?", (until.isoformat(), uid))
+        conn.commit()
+        try:
+            await bot.restrict_chat_member(chat_id=GROUP_CHAT_ID, user_id=uid,
+                                           permissions=ChatPermissions(can_send_messages=False, can_send_other_messages=False),
+                                           until_date=until)
+        except Exception as e:
+            logging.error(f"Mute error: {e}")
+        await query.answer("Замучен на 24 ч.")
+    elif action == "unmute":
+        c.execute("UPDATE users SET muted_until=NULL WHERE user_id=?", (uid,))
+        conn.commit()
+        try:
+            await bot.restrict_chat_member(chat_id=GROUP_CHAT_ID, user_id=uid,
+                                           permissions=ChatPermissions(can_send_messages=True, can_send_other_messages=True))
+        except Exception as e:
+            logging.error(f"Unmute error: {e}")
+        await query.answer("Размучен.")
+    elif action == "cancel":
+        await query.message.edit_text(query.message.text + "\n\n❌ Репорт отменён.")
+        await query.answer("Репорт отменён.")
+        return
+
+    # Обновляем клавиатуру
+    await query.message.edit_reply_markup(reply_markup=None)
+    await query.message.edit_text(query.message.text + "\n\n✅ Жалоба обработана.")
+
+# ---------- Управление аккаунтом (admin) ----------
+@dp.callback_query(F.data == "admin_manage_account")
+async def admin_manage_account(query: CallbackQuery, state: FSMContext):
+    if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
+    if not is_admin(query.from_user.username): await query.answer("Нет доступа."); return
+    await query.message.edit_text("Введите @username или nickname игрока:")
+    await state.set_state(ManageAccountStates.waiting_user)
+
+@dp.message(ManageAccountStates.waiting_user)
+async def manage_account_user(message: Message, state: FSMContext):
+    arg = message.text.strip()
+    target_id = None
+    if arg.startswith('@'):
+        username = arg.lstrip('@').lower()
+        c.execute("SELECT user_id FROM users WHERE username=?", (username,))
+        row = c.fetchone()
+        if row: target_id = row[0]
+    else:
+        c.execute("SELECT user_id FROM users WHERE nickname=?", (arg,))
+        row = c.fetchone()
+        if row: target_id = row[0]
+    if not target_id:
+        await message.answer("Пользователь не найден.")
+        await state.clear()
+        return
+    await state.update_data(target_id=target_id)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Изменить Nickname", callback_data="acc_nick")],
+        [InlineKeyboardButton(text="Изменить ID Standoff 2", callback_data="acc_sid")],
+        [InlineKeyboardButton(text="Изменить аватарку", callback_data="acc_avatar")],
+        [InlineKeyboardButton(text="Изменить баннер", callback_data="acc_banner")],
+        [InlineKeyboardButton(text="Сбросить баннер", callback_data="acc_resetbanner")],
+        [InlineKeyboardButton(text="Сбросить аватарку", callback_data="acc_resetavatar")],
+        [InlineKeyboardButton(text="Отмена", callback_data="acc_cancel")],
+    ])
+    await message.answer("Выберите действие:", reply_markup=keyboard)
+    await state.set_state(ManageAccountStates.waiting_action)
+
+@dp.callback_query(ManageAccountStates.waiting_action, F.data.startswith("acc_"))
+async def manage_account_action(query: CallbackQuery, state: FSMContext, bot: Bot):
+    action = query.data[4:]
+    data = await state.get_data()
+    target_id = data.get("target_id")
+    if action == "cancel":
+        await query.message.edit_text("Действие отменено.")
+        await state.clear()
+        return
+    if action == "nick":
+        await query.message.edit_text("Введите новый никнейм:")
+        await state.update_data(action="nick")
+        await state.set_state(ManageAccountStates.waiting_value)
+    elif action == "sid":
+        await query.message.edit_text("Введите новый ID Standoff 2:")
+        await state.update_data(action="sid")
+        await state.set_state(ManageAccountStates.waiting_value)
+    elif action == "avatar":
+        await query.message.edit_text("Отправьте новую аватарку:")
+        await state.update_data(action="avatar")
+        await state.set_state(ManageAccountStates.waiting_value)
+    elif action == "banner":
+        await query.message.edit_text("Отправьте новый баннер:")
+        await state.update_data(action="banner")
+        await state.set_state(ManageAccountStates.waiting_value)
+    elif action == "resetbanner":
+        c.execute("UPDATE users SET custom_banner=NULL WHERE user_id=?", (target_id,))
+        conn.commit()
+        banner_cache.pop(target_id, None)
+        await query.message.edit_text("Баннер сброшен.")
+        await state.clear()
+    elif action == "resetavatar":
+        c.execute("UPDATE users SET custom_avatar=NULL WHERE user_id=?", (target_id,))
+        conn.commit()
+        avatar_cache.pop(target_id, None)
+        await query.message.edit_text("Аватарка сброшена.")
+        await state.clear()
+
+@dp.message(ManageAccountStates.waiting_value)
+async def manage_account_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    target_id = data.get("target_id")
+    action = data.get("action")
+    if action in ("nick", "sid"):
+        value = message.text.strip()
+        if action == "nick":
+            c.execute("UPDATE users SET nickname=? WHERE user_id=?", (value, target_id))
+        else:
+            c.execute("UPDATE users SET standoff_id=? WHERE user_id=?", (value, target_id))
+        conn.commit()
+        await message.answer("Обновлено.")
+    elif action in ("avatar", "banner"):
+        if not message.photo:
+            await message.answer("Отправьте изображение.")
+            return
+        file_id = message.photo[-1].file_id
+        if action == "avatar":
+            c.execute("UPDATE users SET custom_avatar=? WHERE user_id=?", (file_id, target_id))
+            avatar_cache.pop(target_id, None)
+        else:
+            c.execute("UPDATE users SET custom_banner=? WHERE user_id=?", (file_id, target_id))
+            banner_cache.pop(target_id, None)
+        conn.commit()
+        await message.answer("Обновлено.")
     await state.clear()
 
 # ---------- Инициализация и восстановление ----------
@@ -1384,6 +1954,7 @@ async def main():
     global bot
     bot = Bot(token=TOKEN)
     download_font()
+    download_default_banner()
     load_map_images()
     init_lobbies()
     await restore_all_lobby_posts()
