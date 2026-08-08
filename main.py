@@ -1,4 +1,3 @@
-# bot.py
 import asyncio
 import logging
 import random
