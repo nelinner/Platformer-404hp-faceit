@@ -18,7 +18,6 @@ from aiogram.types import (
     BufferedInputFile,
     InputMediaPhoto,
     ChatPermissions,
-    ForceReply,
 )
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -690,18 +689,25 @@ async def update_lobby_post(bot: Bot, lobby_id: int):
         c.execute("UPDATE lobbies SET message_id=? WHERE id=?", (msg.message_id, lobby_id)); conn.commit()
 
 async def start_draw(bot: Bot, lobby_id: int, mode: str):
+    """Жеребьёвка с гарантированным объединением дуо-пар в одну команду."""
     c.execute("SELECT user_id FROM lobby_registrations WHERE lobby_id=?", (lobby_id,))
     players = [row[0] for row in c.fetchall()]
-    if len(players) < MAX_PLAYERS[mode]: return
+    if len(players) < MAX_PLAYERS[mode]:
+        return
 
+    # 1. Определяем хоста
     host_id = None
     for pid in players:
         c.execute("SELECT username FROM users WHERE user_id=?", (pid,))
         row = c.fetchone()
-        if row and is_admin(row[0]): host_id = pid; break
-    if not host_id: host_id = max(players, key=get_elo)
+        if row and is_admin(row[0]):
+            host_id = pid
+            break
+    if not host_id:
+        host_id = max(players, key=get_elo)
 
-    duo_pairs = {}
+    # 2. Строим уникальные дуо-пары
+    duo_pairs = set()
     for pid in players:
         c.execute("SELECT friend_nickname FROM duos WHERE user_id=?", (pid,))
         for (fnick,) in c.fetchall():
@@ -711,86 +717,74 @@ async def start_draw(bot: Bot, lobby_id: int, mode: str):
                     friend_id = p2
                     break
             if friend_id and friend_id != pid:
-                duo_pairs[pid] = friend_id
+                pair = tuple(sorted((pid, friend_id)))
+                duo_pairs.add(pair)
 
-    random.shuffle(players)
+    half = MAX_PLAYERS[mode] // 2
+    ct = []
+    t = []
+    used = set()
 
-    if mode == "5x5" and len(duo_pairs) <= 2:
-        ct = []
-        t = []
-        used = set()
-        duo_list = list(duo_pairs.items())
-        if len(duo_list) >= 1:
-            p1, p2 = duo_list[0][0], duo_list[0][1]
-            ct.append(p1)
-            ct.append(p2)
+    # 3. Сначала размещаем дуо-пары целиком
+    duo_list = list(duo_pairs)
+    random.shuffle(duo_list)
+    for p1, p2 in duo_list:
+        if p1 in used or p2 in used:
+            continue
+        # Выбираем команду, где больше свободных мест (или меньшую)
+        if len(ct) <= len(t):
+            target_team = ct
+        else:
+            target_team = t
+        if len(target_team) + 2 <= half:
+            target_team.append(p1)
+            target_team.append(p2)
             used.add(p1)
             used.add(p2)
-        if len(duo_list) >= 2:
-            p1, p2 = duo_list[1][0], duo_list[1][1]
-            t.append(p1)
-            t.append(p2)
-            used.add(p1)
-            used.add(p2)
-        remaining = [p for p in players if p not in used]
-        random.shuffle(remaining)
-        half = MAX_PLAYERS[mode] // 2
-        for p in remaining:
-            if len(ct) < half:
+
+    # 4. Оставшихся распределяем случайно
+    remaining = [p for p in players if p not in used]
+    random.shuffle(remaining)
+    for p in remaining:
+        if len(ct) < half:
+            ct.append(p)
+        else:
+            t.append(p)
+
+    # 5. Добиваем команды до ровного счёта (если вдруг не хватило)
+    while len(ct) < half:
+        for p in players:
+            if p not in ct and p not in t:
                 ct.append(p)
-            else:
+                break
+    while len(t) < half:
+        for p in players:
+            if p not in ct and p not in t:
                 t.append(p)
-        while len(ct) < half:
-            for p in players:
-                if p not in ct and p not in t:
-                    ct.append(p)
-                    break
-        while len(t) < half:
-            for p in players:
-                if p not in ct and p not in t:
-                    t.append(p)
-                    break
-    else:
-        half = len(players)//2
-        ct = players[:half]
-        t = players[half:]
-        if duo_pairs:
-            for p1, p2 in duo_pairs.items():
-                if (p1 in ct and p2 in ct) or (p1 in t and p2 in t):
-                    if p1 in ct:
-                        for idx, p_other in enumerate(t):
-                            if p_other not in duo_pairs and p_other not in duo_pairs.values():
-                                ct[ct.index(p1)] = p_other
-                                t[idx] = p1
-                                break
-                    else:
-                        for idx, p_other in enumerate(ct):
-                            if p_other not in duo_pairs and p_other not in duo_pairs.values():
-                                t[t.index(p1)] = p_other
-                                ct[idx] = p1
-                                break
-            ct = [p for p in players if p in ct]
-            t = [p for p in players if p in t]
+                break
 
+    # 6. Сохраняем матч
     now = datetime.now().isoformat()
     c.execute("SELECT match_number, map_name FROM lobbies WHERE id=?", (lobby_id,))
     match_num, map_name = c.fetchone()
     c.execute("INSERT INTO matches (lobby_id, match_number, status, created_at, host_id) VALUES (?,?, 'drawn',?,?)",
               (lobby_id, match_num, now, host_id))
     match_id = c.lastrowid
-    for p in ct: c.execute("INSERT INTO match_players (match_id, user_id, team) VALUES (?,?,'CT')", (match_id, p))
-    for p in t: c.execute("INSERT INTO match_players (match_id, user_id, team) VALUES (?,?,'T')", (match_id, p))
+    for p in ct:
+        c.execute("INSERT INTO match_players (match_id, user_id, team) VALUES (?,?,'CT')", (match_id, p))
+    for p in t:
+        c.execute("INSERT INTO match_players (match_id, user_id, team) VALUES (?,?,'T')", (match_id, p))
     c.execute("UPDATE lobbies SET match_number = match_number + 1 WHERE id=?", (lobby_id,))
     c.execute("DELETE FROM lobby_registrations WHERE lobby_id=?", (lobby_id,))
     conn.commit()
 
+    # 7. Отправляем результаты
     img_data = await generate_draft_image(bot, lobby_id, mode, ct, t, map_name, match_num, host_id)
     if img_data:
         photo = BufferedInputFile(img_data.read(), filename="draft.png")
         await bot.send_photo(GROUP_CHAT_ID, photo, message_thread_id=TOPIC_DRAW)
 
     host_nick = get_nickname(host_id)
-    host_sid = get_standoff_id(host_id)
     text_draw = (
         f"ℹ️ Жеребьёвка игроков по командам\n"
         f"404hp faceit | host by: {host_nick}\n"
@@ -799,7 +793,7 @@ async def start_draw(bot: Bot, lobby_id: int, mode: str):
     )
     for p in ct:
         text_draw += f"> 👤 {get_nickname(p)} | ID {get_standoff_id(p)}\n"
-    text_draw += f"\n🔫 Terrorists:\n"
+    text_draw += "\n🔫 Terrorists:\n"
     for p in t:
         text_draw += f"> 👤 {get_nickname(p)} | ID {get_standoff_id(p)}\n"
     text_draw += (
@@ -1946,7 +1940,10 @@ async def restore_all_lobby_posts():
     c.execute("SELECT id FROM lobbies WHERE message_id IS NULL")
     lobbies_to_restore = [row[0] for row in c.fetchall()]
     for lobby_id in lobbies_to_restore:
-        await update_lobby_post(bot, lobby_id)
+        try:
+            await update_lobby_post(bot, lobby_id)
+        except Exception as e:
+            logging.error(f"Не удалось восстановить пост лобби {lobby_id}: {e}")
         await asyncio.sleep(0.5)
 
 async def main():
