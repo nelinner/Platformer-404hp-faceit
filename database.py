@@ -21,7 +21,8 @@ def init_db():
         banned_until TEXT,
         muted_until TEXT,
         premium INTEGER DEFAULT 0,
-        game_ban INTEGER DEFAULT 0
+        game_ban INTEGER DEFAULT 0,
+        badge TEXT DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS lobbies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,6 +109,7 @@ def init_db():
         "ALTER TABLE users ADD COLUMN wins INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN losses INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN game_ban INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN badge TEXT DEFAULT ''",
     ]
     for mig in migrations:
         try:
@@ -256,3 +258,167 @@ def get_admin_ids():
         if row:
             admin_ids.append(row[0])
     return admin_ids
+
+# ----------------- Новые функции для управления лобби и матчами -----------------
+
+def get_lobbies_with_players():
+    """Возвращает список лобби (id, mode, thread_id, количество игроков),
+       в которых есть хотя бы один зарегистрированный игрок."""
+    c.execute("""
+        SELECT l.id, l.mode, l.thread_id, COUNT(lr.user_id)
+        FROM lobbies l
+        INNER JOIN lobby_registrations lr ON l.id = lr.lobby_id
+        GROUP BY l.id
+        HAVING COUNT(lr.user_id) > 0
+    """)
+    return c.fetchall()
+
+def get_players_in_lobby(lobby_id):
+    """Возвращает список (user_id, nickname) игроков в указанном лобби."""
+    c.execute("""
+        SELECT u.user_id, u.nickname
+        FROM lobby_registrations lr
+        JOIN users u ON lr.user_id = u.user_id
+        WHERE lr.lobby_id = ?
+    """, (lobby_id,))
+    return c.fetchall()
+
+def remove_player_from_lobby(lobby_id, user_id):
+    """Удаляет игрока из лобби."""
+    c.execute("DELETE FROM lobby_registrations WHERE lobby_id = ? AND user_id = ?",
+              (lobby_id, user_id))
+    conn.commit()
+
+def add_player_to_lobby(lobby_id, user_id):
+    """Добавляет игрока в лобби, если он не забанен, не имеет игрового бана и ещё не в лобби.
+       Возвращает True при успехе, иначе False."""
+    if is_banned(user_id) or is_game_banned(user_id):
+        return False
+    c.execute("SELECT 1 FROM lobby_registrations WHERE lobby_id=? AND user_id=?", (lobby_id, user_id))
+    if c.fetchone():
+        return False
+    c.execute("INSERT INTO lobby_registrations (lobby_id, user_id, joined_at) VALUES (?, ?, ?)",
+              (lobby_id, user_id, datetime.now().isoformat()))
+    conn.commit()
+    return True
+
+def get_user_active_matches(user_id):
+    """Возвращает список активных матчей (id, lobby_id, match_number, map_name, mode, created_at),
+       где пользователь является хостом и статус = 'drawn'."""
+    c.execute("""
+        SELECT m.id, m.lobby_id, m.match_number, l.map_name, l.mode, m.created_at
+        FROM matches m
+        JOIN lobbies l ON m.lobby_id = l.id
+        WHERE m.host_id = ? AND m.status = 'drawn'
+        ORDER BY m.created_at DESC
+    """, (user_id,))
+    return c.fetchall()
+
+def cancel_match(match_id):
+    """Отменяет матч (ставит статус 'cancelled')."""
+    c.execute("UPDATE matches SET status = 'cancelled' WHERE id = ?", (match_id,))
+    conn.commit()
+
+def get_match_info(match_id):
+    """Возвращает (match_id, lobby_id, match_number, map_name, mode, host_id, status)
+       для указанного матча."""
+    c.execute("""
+        SELECT m.id, m.lobby_id, m.match_number, l.map_name, l.mode, m.host_id, m.status
+        FROM matches m
+        JOIN lobbies l ON m.lobby_id = l.id
+        WHERE m.id = ?
+    """, (match_id,))
+    return c.fetchone()
+
+# ----------------- Функции для бейджей -----------------
+
+def get_user_badge(user_id):
+    c.execute("SELECT badge FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else ""
+
+def set_user_badge(user_id, badge):
+    c.execute("UPDATE users SET badge=? WHERE user_id=?", (badge, user_id))
+    conn.commit()
+
+# ----------------- Функции для DUO -----------------
+
+def get_duo_partner(user_id):
+    """Возвращает user_id партнёра по дуо, либо None."""
+    c.execute("SELECT friend_nickname FROM duos WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    if not row:
+        return None
+    friend_nick = row[0]
+    # Ищем партнёра по никнейму
+    c.execute("SELECT user_id FROM users WHERE nickname=?", (friend_nick,))
+    row2 = c.fetchone()
+    return row2[0] if row2 else None
+
+def remove_duo(user_id):
+    """Удаляет дуо-связку для обоих участников."""
+    # Получаем партнёра
+    c.execute("SELECT friend_nickname FROM duos WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    if row:
+        partner_nick = row[0]
+        # Удаляем запись у инициатора
+        c.execute("DELETE FROM duos WHERE user_id=?", (user_id,))
+        # Удаляем запись у партнёра (если он есть в БД)
+        c.execute("DELETE FROM duos WHERE user_id IN (SELECT user_id FROM users WHERE nickname=?)", (partner_nick,))
+        conn.commit()
+
+# ----------------- Функции для управления результатами -----------------
+
+def get_all_finished_matches():
+    """Возвращает список всех завершённых матчей (status='finished')."""
+    c.execute("""
+        SELECT m.id, m.lobby_id, m.match_number, l.map_name, l.mode, m.host_id, m.score
+        FROM matches m
+        JOIN lobbies l ON m.lobby_id = l.id
+        WHERE m.status = 'finished'
+        ORDER BY m.created_at DESC
+    """)
+    return c.fetchall()
+
+def update_match_score(match_id, new_ct_score, new_t_score):
+    """Обновляет счёт матча и пересчитывает ELO."""
+    # Получаем старый счёт
+    c.execute("SELECT score FROM matches WHERE id=?", (match_id,))
+    row = c.fetchone()
+    if not row or not row[0]:
+        return False
+    old_score = row[0].split('-')
+    old_ct = int(old_score[0])
+    old_t = int(old_score[1])
+
+    # Обновляем счёт
+    c.execute("UPDATE matches SET score=? WHERE id=?", (f"{new_ct_score}-{new_t_score}", match_id))
+
+    # Получаем игроков матча
+    c.execute("SELECT user_id, team FROM match_players WHERE match_id=?", (match_id,))
+    players = c.fetchall()
+
+    # Сначала откатываем старые изменения ELO
+    for uid, team in players:
+        is_winner_old = (team == 'CT' and old_ct > old_t) or (team == 'T' and old_t > old_ct)
+        premium = is_premium(uid)
+        delta_old = (50 if premium else 25) if is_winner_old else (-15 if premium else -10)
+        current_elo = get_elo(uid)
+        # Откатываем: вычитаем то, что добавили
+        c.execute("UPDATE users SET elo = ?, wins = CASE WHEN ? THEN wins - 1 ELSE wins END, losses = CASE WHEN ? THEN losses ELSE losses - 1 END WHERE user_id=?",
+                  (max(0, current_elo - delta_old), is_winner_old, is_winner_old, uid))
+
+    # Начисляем ELO заново
+    for uid, team in players:
+        is_winner_new = (team == 'CT' and new_ct_score > new_t_score) or (team == 'T' and new_t_score > new_ct_score)
+        premium = is_premium(uid)
+        delta_new = (50 if premium else 25) if is_winner_new else (-15 if premium else -10)
+        new_elo = max(0, get_elo(uid) + delta_new)
+        if is_winner_new:
+            c.execute("UPDATE users SET wins = wins + 1, elo = ? WHERE user_id=?", (new_elo, uid))
+        else:
+            c.execute("UPDATE users SET losses = losses + 1, elo = ? WHERE user_id=?", (new_elo, uid))
+
+    conn.commit()
+    return True
