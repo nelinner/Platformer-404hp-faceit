@@ -58,8 +58,17 @@ avatar_cache = {}
 banner_cache = {}
 font_cache = {}
 
+# Загрузка шрифта при старте
+try:
+    if not os.path.exists(FONT_PATH):
+        r = requests.get(FONT_URL, timeout=15)
+        if r.status_code == 200:
+            with open(FONT_PATH, "wb") as f:
+                f.write(r.content)
+except: pass
+
 # ------------------------------------------------------------
-# Вспомогательные функции (шрифты, загрузка карт, проверка владельца меню)
+# Вспомогательные функции
 # ------------------------------------------------------------
 def get_font(size):
     try:
@@ -71,7 +80,6 @@ def get_font(size):
     return font_cache[size]
 
 def draw_ring(draw, cx, cy, r, width, percent, color, bg_color):
-    """Рисует кольцо прогресса."""
     draw.ellipse([cx-r, cy-r, cx+r, cy+r], outline=bg_color, width=width)
     if percent <= 0: return
     steps = int(50 * percent / 100)
@@ -2235,6 +2243,9 @@ async def restore_all_lobby_posts():
 async def main():
     global bot
     init_db()
+    # Загрузка карт при старте
+    for name in MAP_URLS:
+        download_map_image(name)
     init_lobbies()
 
     bot = Bot(token=TOKEN)
