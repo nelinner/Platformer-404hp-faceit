@@ -1,13 +1,13 @@
 import asyncio
 import logging
 import random
-import sqlite3
 import os
 import requests
 from datetime import datetime, timedelta
 from io import BytesIO
 from math import pi, cos, sin
 from typing import Optional
+from html import escape as html_escape
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
@@ -52,23 +52,15 @@ dp = Dispatcher(storage=MemoryStorage())
 report_router = Router()
 bot: Bot = None
 
-# Кэши
+# Кэши и временные словари
+font_cache = {}
 map_images_cache = {}
 avatar_cache = {}
 banner_cache = {}
-font_cache = {}
-
-# Загрузка шрифта при старте
-try:
-    if not os.path.exists(FONT_PATH):
-        r = requests.get(FONT_URL, timeout=15)
-        if r.status_code == 200:
-            with open(FONT_PATH, "wb") as f:
-                f.write(r.content)
-except: pass
+last_report_time = {}
 
 # ------------------------------------------------------------
-# Вспомогательные функции
+# Вспомогательные функции (изображения, загрузка ресурсов)
 # ------------------------------------------------------------
 def get_font(size):
     try:
@@ -104,16 +96,41 @@ def fit_image(img, w, h):
 def download_map_image(map_name):
     if map_name in map_images_cache:
         return map_images_cache[map_name].copy()
-    if map_name in MAP_URLS:
+    return None
+
+def load_map_images():
+    for name, url in MAP_URLS.items():
         try:
-            resp = requests.get(MAP_URLS[map_name], timeout=10)
+            resp = requests.get(url, timeout=10)
             if resp.status_code == 200:
                 img = Image.open(BytesIO(resp.content)).convert("RGBA")
-                map_images_cache[map_name] = img
-                return img.copy()
-        except:
-            pass
-    return None
+                map_images_cache[name] = img
+        except Exception as e:
+            logging.error(f"Не удалось загрузить карту {name}: {e}")
+
+def download_font():
+    if os.path.exists(FONT_PATH): return
+    try:
+        r = requests.get(FONT_URL, timeout=15)
+        if r.status_code == 200 and len(r.content) > 1000:
+            with open(FONT_PATH, "wb") as f:
+                f.write(r.content)
+    except: pass
+
+def download_default_banner():
+    if os.path.exists(DEFAULT_BANNER_PATH): return
+    try:
+        r = requests.get(DEFAULT_BANNER_URL, timeout=15)
+        if r.status_code == 200 and len(r.content) > 1000:
+            with open(DEFAULT_BANNER_PATH, "wb") as f:
+                f.write(r.content)
+    except: pass
+
+async def check_subscription(bot: Bot, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        return member.status not in [ChatMemberStatus.LEFT, ChatMemberStatus.RESTRICTED]
+    except: return False
 
 async def get_user_avatar(bot: Bot, user_id: int) -> Optional[BytesIO]:
     try:
@@ -128,6 +145,19 @@ async def get_user_avatar(bot: Bot, user_id: int) -> Optional[BytesIO]:
 
 async def get_custom_avatar(bot: Bot, user_id: int) -> Optional[BytesIO]:
     c.execute("SELECT custom_avatar FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    if row and row[0]:
+        try:
+            file = await bot.get_file(row[0])
+            bio = BytesIO()
+            await bot.download_file(file.file_path, bio)
+            bio.seek(0)
+            return bio
+        except: pass
+    return None
+
+async def get_custom_banner(bot: Bot, user_id: int) -> Optional[BytesIO]:
+    c.execute("SELECT custom_banner FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
     if row and row[0]:
         try:
@@ -154,19 +184,6 @@ async def get_avatar_image_cached(bot: Bot, user_id: int) -> Optional[Image.Imag
     avatar_cache[user_id] = img
     return img
 
-async def get_custom_banner(bot: Bot, user_id: int) -> Optional[BytesIO]:
-    c.execute("SELECT custom_banner FROM users WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    if row and row[0]:
-        try:
-            file = await bot.get_file(row[0])
-            bio = BytesIO()
-            await bot.download_file(file.file_path, bio)
-            bio.seek(0)
-            return bio
-        except: pass
-    return None
-
 async def get_banner_cached(bot: Bot, user_id: int) -> Optional[Image.Image]:
     if user_id in banner_cache:
         return banner_cache[user_id]
@@ -184,7 +201,11 @@ async def get_banner_cached(bot: Bot, user_id: int) -> Optional[Image.Image]:
     banner_cache[user_id] = img
     return img
 
+# ------------------------------------------------------------
+# Форматирование имени с username
+# ------------------------------------------------------------
 def player_display_name(user_id):
+    """Возвращает 'nick (@username)' или 'nick' если username отсутствует."""
     nick = get_nickname(user_id)
     c.execute("SELECT username FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
@@ -197,9 +218,11 @@ def is_owner_of_menu(query: CallbackQuery) -> bool:
     return query.message.chat.id == query.from_user.id
 
 # ------------------------------------------------------------
-# Генерация профиля (Pillow)
+# Генерация профиля и слотов
 # ------------------------------------------------------------
-def generate_profile_card(user_id: int, username: Optional[str] = None) -> BytesIO:
+def generate_profile_card(user_id: int, username: Optional[str] = None,
+                          cached_avatar: Optional[Image.Image] = None,
+                          cached_banner: Optional[Image.Image] = None) -> BytesIO:
     elo, wins, losses = get_user_stats(user_id)
     total = wins + losses
     winrate = (wins / total * 100) if total > 0 else 0
@@ -223,9 +246,9 @@ def generate_profile_card(user_id: int, username: Optional[str] = None) -> Bytes
 
     cell_h = 180
     cell_y = 15
-    if user_id in banner_cache and banner_cache[user_id]:
+    if cached_banner:
         try:
-            banner_resized = banner_cache[user_id].resize((w-30, cell_h), Image.Resampling.LANCZOS)
+            banner_resized = cached_banner.resize((w-30, cell_h), Image.Resampling.LANCZOS)
             dark = Image.new('RGBA', (w-30, cell_h), (0,0,0,115))
             banner_resized = Image.alpha_composite(banner_resized, dark)
             img.paste(banner_resized, (15, cell_y))
@@ -235,10 +258,10 @@ def generate_profile_card(user_id: int, username: Optional[str] = None) -> Bytes
     avatar_size = 120
     avatar_x = 40
     avatar_cy = cell_y + cell_h//2
-    if user_id in avatar_cache and avatar_cache[user_id]:
+    if cached_avatar:
         mask = Image.new('L', (avatar_size, avatar_size), 0)
         ImageDraw.Draw(mask).ellipse((0,0,avatar_size,avatar_size), fill=255)
-        avatar_img = avatar_cache[user_id].resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
+        avatar_img = cached_avatar.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
         img.paste(avatar_img, (avatar_x, avatar_cy - avatar_size//2), mask)
         draw.ellipse([avatar_x-5, avatar_cy-avatar_size//2-5, avatar_x+avatar_size+5, avatar_cy+avatar_size//2+5],
                      outline=FACEIT_ORANGE, width=4)
@@ -305,83 +328,240 @@ def generate_profile_card(user_id: int, username: Optional[str] = None) -> Bytes
     bio.seek(0)
     return bio
 
-# ------------------------------------------------------------
-# Генерация лобби (Pillow)
-# ------------------------------------------------------------
-async def generate_lobby_image(bot: Bot, lobby_id: int) -> Optional[BytesIO]:
-    c.execute("SELECT mode, map_name FROM lobbies WHERE id=?", (lobby_id,))
-    lobby = c.fetchone()
-    if not lobby: return None
-    mode, map_name = lobby
-    c.execute("SELECT user_id FROM lobby_registrations WHERE lobby_id=? ORDER BY joined_at", (lobby_id,))
-    player_ids = [row[0] for row in c.fetchall()]
-    filled = len(player_ids)
-    maxp = MAX_PLAYERS[mode]
-    percent = int((filled / maxp) * 100) if maxp else 0
+def draw_player_slot(draw, x, y, w, h, user_id, elo, sid, avatar=None, banner=None,
+                     is_owner=False, is_admin=False, premium=False, compact=False):
+    try:
+        if compact:
+            avatar_r = 40
+            base_font_size = 30
+            font_elo_size = 24
+            font_id_size = 18
+            font_badge_size = 14
+            overlay_h = 40
+            max_width_nick = w - 130
+            text_y_nick = y + 16
+            text_y_elo = y + 50
+            text_y_id = y + 74
+        else:
+            avatar_r = 54
+            base_font_size = 38
+            font_elo_size = 28
+            font_id_size = 22
+            font_badge_size = 16
+            overlay_h = 50
+            max_width_nick = w - 180
+            text_y_nick = y + 22
+            text_y_elo = y + 68
+            text_y_id = y + 100
 
-    width, height = 1720, 1080
-    img = Image.new('RGB', (width, height), (10,11,16))
-    draw = ImageDraw.Draw(img)
+        if banner:
+            try:
+                bg_img = banner.resize((w, h), Image.Resampling.LANCZOS)
+                dark = Image.new('RGBA', (w, h), (0,0,0,153))
+                bg_img = Image.alpha_composite(bg_img, dark)
+                draw._image.paste(bg_img, (x, y))
+            except:
+                draw.rounded_rectangle([x, y, x+w, y+h], radius=18, fill=(22,25,35), outline=(55,60,75), width=2)
+        else:
+            draw.rounded_rectangle([x, y, x+w, y+h], radius=18, fill=(22,25,35), outline=(55,60,75), width=2)
+
+        draw.rounded_rectangle([x+3, y+3, x+w-3, y+h-3], radius=16, outline=(255,160,50,75), width=3)
+
+        overlay = Image.new('RGBA', (w, overlay_h))
+        for oy in range(overlay_h):
+            alpha = int(40 * (1 - oy / overlay_h))
+            for ox in range(w):
+                overlay.putpixel((ox, oy), (0,0,0,alpha))
+        draw._image.paste(overlay, (x, y + h - overlay_h))
+
+        avatar_cx = x + (avatar_r + 18)
+        avatar_cy = y + h//2
+        if avatar:
+            mask = Image.new('L', (avatar_r*2, avatar_r*2), 0)
+            ImageDraw.Draw(mask).ellipse((0,0,avatar_r*2,avatar_r*2), fill=255)
+            avatar_resized = avatar.resize((avatar_r*2, avatar_r*2), Image.Resampling.LANCZOS)
+            draw._image.paste(avatar_resized, (avatar_cx-avatar_r, avatar_cy-avatar_r), mask)
+            draw.ellipse([avatar_cx-avatar_r-2, avatar_cy-avatar_r-2, avatar_cx+avatar_r+2, avatar_cy+avatar_r+2],
+                         outline=FACEIT_ORANGE, width=3)
+        else:
+            draw.ellipse([avatar_cx-avatar_r, avatar_cy-avatar_r, avatar_cx+avatar_r, avatar_cy+avatar_r],
+                         fill=(35,38,55), outline=FACEIT_ORANGE, width=3)
+
+        display_name = player_display_name(user_id)
+
+        font_size = base_font_size
+        font_nick = get_font(font_size)
+        while font_size > 14:
+            bbox = draw.textbbox((0,0), display_name, font=font_nick)
+            if (bbox[2]-bbox[0]) <= max_width_nick:
+                break
+            font_size -= 2
+            font_nick = get_font(font_size)
+
+        if is_admin or is_owner or premium:
+            badge_text = "OWNER" if is_owner else ("ADMIN" if is_admin else "PREMIUM")
+            badge_bg = (255, 215, 0, 200)
+            badge_fg = (0, 0, 0)
+            if is_admin and not is_owner:
+                badge_bg = (200, 0, 0, 200)
+                badge_fg = (255, 255, 255)
+            font_badge = get_font(font_badge_size)
+            nick_bbox = draw.textbbox((0,0), display_name, font=font_nick)
+            nick_w = nick_bbox[2] - nick_bbox[0]
+            badge_bbox = draw.textbbox((0,0), badge_text, font=font_badge)
+            badge_w = badge_bbox[2] - badge_bbox[0] + 12
+            badge_h = badge_bbox[3] - badge_bbox[1] + 6
+            badge_x = avatar_cx + avatar_r + 20 + nick_w + 6
+            badge_y = text_y_nick - 4
+            draw.rounded_rectangle([badge_x, badge_y, badge_x+badge_w, badge_y+badge_h], radius=6, fill=badge_bg)
+            draw.text((badge_x+6, badge_y+2), badge_text, fill=badge_fg, font=font_badge)
+
+        draw.text((avatar_cx + avatar_r + 16, text_y_nick), display_name, font=font_nick, fill='white')
+        font_elo = get_font(font_elo_size)
+        draw.text((avatar_cx + avatar_r + 16, text_y_elo), f"{elo} ELO", font=font_elo, fill='#b0d0ff')
+        font_id = get_font(font_id_size)
+        draw.text((avatar_cx + avatar_r + 16, text_y_id), f"ID: {sid}", font=font_id, fill=TEXT_GRAY)
+
+    except Exception as e:
+        logging.error(f"draw_player_slot error: {e}")
+
+def draw_lobby_background(draw, width, height):
     for y in range(height):
         ratio = y / height
         r = int(10 + 30 * ratio)
         g = int(11 + 40 * ratio)
         b = int(16 + 45 * ratio)
-        draw.line([(0, y), (width, y)], fill=(r, g, b))
+        draw.rectangle([(0, y), (width, y+1)], fill=(r, g, b, 255))
 
-    draw.rounded_rectangle([18,18,width-18,height-18], radius=36, outline=FACEIT_ORANGE, width=6)
-    draw.rounded_rectangle([26,26,width-26,height-26], radius=30, outline=(255,255,255,38), width=2)
+async def generate_lobby_image(bot: Bot, lobby_id: int) -> Optional[BytesIO]:
+    try:
+        c.execute("SELECT mode, map_name FROM lobbies WHERE id=?", (lobby_id,))
+        lobby = c.fetchone()
+        if not lobby: return None
+        mode, map_name = lobby
 
-    font_title = get_font(48)
-    draw.text((52,38), "MATCHMAKING", font=get_font(96), fill=FACEIT_ORANGE)
-    draw.text((52,130), f"{mode} • COMPETITIVE", font=get_font(46), fill="#e0e0e0")
+        c.execute("SELECT user_id FROM lobby_registrations WHERE lobby_id=? ORDER BY joined_at", (lobby_id,))
+        player_ids = [row[0] for row in c.fetchall()]
+        filled = len(player_ids)
+        maxp = MAX_PLAYERS[mode]
+        percent = int((filled / maxp) * 100) if maxp else 0
 
-    map_img = download_map_image(map_name)
-    if map_img:
-        map_img = fit_image(map_img, 780, 435)
-        img.paste(map_img, (48, 205))
+        width, height = 1720, 1080
+        img = Image.new('RGBA', (width, height), (0,0,0,0))
+        draw = ImageDraw.Draw(img)
+        draw_lobby_background(draw, width, height)
 
-    draw_ring(draw, 48+112, 670+79, 72, 19, percent, FACEIT_ORANGE, (30,33,45))
-    draw.text((48+112, 670+79), f"{percent}%", font=get_font(56), fill='white', anchor='mm')
-    draw.text((48+400, 670+79), f"{filled}/{maxp}", font=get_font(82), fill='white', anchor='mm')
-    draw.text((48+400, 670+130), "PLAYERS IN LOBBY", font=get_font(34), fill='#a0b0d0', anchor='mt')
+        draw.rounded_rectangle([18,18,width-18,height-18], radius=36, outline=FACEIT_ORANGE, width=6)
+        draw.rounded_rectangle([26,26,width-26,height-26], radius=30, outline=(255,255,255,38), width=2)
 
-    slot_x, slot_y = 860, 155
-    slot_w, slot_h = 400, 158
-    for i in range(maxp):
-        col = i % 2
-        row = i // 2
-        x = slot_x + col * (slot_w + 24)
-        y = slot_y + row * (slot_h + 16)
-        if i < filled:
-            pid = player_ids[i]
-            draw.rounded_rectangle([x, y, x+slot_w, y+slot_h], radius=18, fill=(22,25,35), outline=FACEIT_ORANGE, width=2)
-            draw.text((x+slot_w//2, y+slot_h//2), player_display_name(pid), font=get_font(32), fill='white', anchor='mm')
+        title1 = "404hp "
+        title2 = "FACEIT"
+        font_title = get_font(48)
+        w1 = draw.textlength(title1, font=font_title)
+        w2 = draw.textlength(title2, font=font_title)
+        total_w = w1 + w2
+        right_margin = width - 50 - total_w
+        draw.text((right_margin, 38), title1, fill='white', font=font_title)
+        draw.text((right_margin + w1, 38), title2, fill=FACEIT_ORANGE, font=font_title)
+
+        draw.text((52,38), "MATCHMAKING", font=get_font(96), fill=FACEIT_ORANGE)
+        draw.text((52,130), f"{mode} • COMPETITIVE", font=get_font(46), fill="#e0e0e0")
+
+        map_x, map_y = 48, 205
+        map_w, map_h = 780, 435
+        draw.rounded_rectangle([map_x, map_y, map_x+map_w, map_y+map_h], radius=22, fill=(18,20,30), outline=(255,255,255,55), width=3)
+        map_img = download_map_image(map_name)
+        if map_img:
+            map_img = fit_image(map_img, map_w, map_h)
+            img.paste(map_img, (map_x, map_y))
         else:
-            draw.rounded_rectangle([x, y, x+slot_w, y+slot_h], radius=18, fill=(255,255,255,12), outline=(255,255,255,40))
-            draw.text((x+slot_w//2, y+slot_h//2), "WAITING...", font=get_font(32), fill='#666688', anchor='mm')
+            draw.rectangle([map_x, map_y, map_x+map_w, map_y+map_h], fill=(16,18,26))
 
-    draw.text((width//2, height-38), "404hp FACEIT © 2026", font=get_font(32), fill='#777788', anchor='mt')
-    img = img.filter(ImageFilter.SHARPEN)
-    bio = BytesIO()
-    img.save(bio, format="PNG")
-    bio.seek(0)
-    return bio
+        overlay = Image.new('RGBA', (map_w, 60), (0,0,0,200))
+        odraw = ImageDraw.Draw(overlay)
+        map_text = f"CURRENT MAP: {map_name.upper() if map_name else 'NO MAP'}"
+        odraw.text((20, 10), map_text, font=get_font(28), fill='#ffddaa')
+        img.paste(overlay, (map_x, map_y + map_h - 60))
 
-# ------------------------------------------------------------
-# Генерация жеребьёвки (Pillow)
-# ------------------------------------------------------------
+        prog_x, prog_y = 48, 670
+        prog_w, prog_h = 780, 158
+        draw.rounded_rectangle([prog_x, prog_y, prog_x+prog_w, prog_y+prog_h], radius=22, fill=(18,20,30), outline=(255,255,255,45), width=3)
+        draw_ring(draw, prog_x+112, prog_y+79, 72, 19, percent, FACEIT_ORANGE, (30,33,45))
+        draw.text((prog_x+112, prog_y+79), f"{percent}%", font=get_font(56), fill='white', anchor='mm')
+        draw.text((prog_x+400, prog_y+79), f"{filled}/{maxp}", font=get_font(82), fill='white', anchor='mm')
+        draw.text((prog_x+400, prog_y+130), "PLAYERS IN LOBBY", font=get_font(34), fill='#a0b0d0', anchor='mt')
+
+        tasks = [get_avatar_image_cached(bot, pid) for pid in player_ids] + \
+                [get_banner_cached(bot, pid) for pid in player_ids]
+        results = await asyncio.gather(*tasks)
+        avatars = {pid: results[i] for i, pid in enumerate(player_ids)}
+        banners = {pid: results[i+len(player_ids)] for i, pid in enumerate(player_ids)}
+
+        slot_x, slot_y = 860, 155
+        slot_w, slot_h = 400, 158
+        gap_x, gap_y = 24, 16
+        cols = 2
+
+        for i in range(maxp):
+            col = i % cols
+            row = i // cols
+            x = slot_x + col * (slot_w + gap_x)
+            y = slot_y + row * (slot_h + gap_y)
+
+            if i < filled:
+                pid = player_ids[i]
+                elo = get_elo(pid)
+                sid = get_standoff_id(pid)
+                av = avatars[pid]
+                bn = banners[pid]
+                c.execute("SELECT username FROM users WHERE user_id=?", (pid,))
+                uname = c.fetchone()
+                is_own = (pid == OWNER_ID)
+                is_adm = uname and is_admin(uname[0])
+                premium = is_premium(pid)
+                draw_player_slot(draw, x, y, slot_w, slot_h, pid, elo, sid, av, bn, is_own, is_adm, premium)
+            else:
+                draw.rounded_rectangle([x, y, x+slot_w, y+slot_h], radius=18, fill=(255,255,255,12), outline=(255,255,255,40))
+                font_wait = get_font(32)
+                wait_text = "WAITING\nFOR PLAYER..."
+                lines = wait_text.split('\n')
+                line_h = font_wait.size * 1.2
+                total_h = len(lines) * line_h
+                cy = y + slot_h//2 - total_h//2
+                for idx, line in enumerate(lines):
+                    bbox = draw.textbbox((0,0), line, font=font_wait)
+                    lw = bbox[2]-bbox[0]
+                    draw.text((x+slot_w//2, cy + idx*line_h), line, font=font_wait, fill='#666688', anchor="ma")
+
+        draw.text((width//2, height-38), "404hp FACEIT © 2026", font=get_font(32), fill='#777788', anchor='mt')
+
+        final_img = Image.new('RGB', (width, height), (10,11,16))
+        final_img.paste(img, (0,0), img)
+        final_img = final_img.filter(ImageFilter.SHARPEN)
+        bio = BytesIO()
+        final_img.save(bio, format="PNG")
+        bio.seek(0)
+        return bio
+    except Exception as e:
+        logging.error(f"generate_lobby_image error: {e}")
+        return None
+
 async def generate_draft_image(bot, lobby_id, mode, ct_ids, t_ids, map_name, match_num, host_id):
     try:
         width, height = 1920, 1080
-        img = Image.new('RGB', (width, height), DARK_BG)
+        img = Image.new('RGBA', (width, height), (0,0,0,0))
         draw = ImageDraw.Draw(img)
-        for y in range(height):
-            ratio = y / height
-            r = int(10 + 30 * ratio)
-            g = int(11 + 40 * ratio)
-            b = int(16 + 45 * ratio)
-            draw.line([(0, y), (width, y)], fill=(r, g, b))
+        draw_lobby_background(draw, width, height)
+
+        title1 = "404hp "
+        title2 = "FACEIT"
+        font_title = get_font(48)
+        w1 = draw.textlength(title1, font=font_title)
+        w2 = draw.textlength(title2, font=font_title)
+        total_w = w1 + w2
+        right_margin = width - 50 - total_w
+        draw.text((right_margin, 38), title1, fill='white', font=font_title)
+        draw.text((right_margin + w1, 38), title2, fill=FACEIT_ORANGE, font=font_title)
 
         draw.text((width//2, 60), "Жеребьёвка", font=get_font(72), fill='white', anchor="mt")
 
@@ -403,6 +583,9 @@ async def generate_draft_image(bot, lobby_id, mode, ct_ids, t_ids, map_name, mat
             img.paste(map_img, (center_x+40, map_y))
             draw.rounded_rectangle([center_x+40-4, map_y-4, center_x+center_w-40+4, map_y+340+4],
                                    radius=12, outline=FACEIT_ORANGE, width=4)
+        else:
+            draw.rounded_rectangle([center_x+40,map_y,center_x+center_w-40,map_y+340], radius=8, fill=(30,35,45))
+            draw.text((center_x+center_w//2,map_y+170), "NO MAP", font=get_font(48), fill=TEXT_GRAY, anchor="mm")
 
         host_text = f"👑 Хост: {player_display_name(host_id)} | Матч #{match_num}"
         draw.text((center_x+center_w//2, map_y+370), host_text, font=get_font(32), fill=GOLD, anchor="mt")
@@ -419,26 +602,48 @@ async def generate_draft_image(bot, lobby_id, mode, ct_ids, t_ids, map_name, mat
         draw.text((center_x+60,elo_y+8), str(ct_elo), font=get_font(42), fill='white')
         draw.text((center_x+center_w-60,elo_y+8), str(t_elo), font=get_font(42), fill='white', anchor="ra")
 
-        font_slot = get_font(28)
+        all_ids = ct_ids + t_ids
+        tasks = [get_avatar_image_cached(bot, pid) for pid in all_ids] + \
+                [get_banner_cached(bot, pid) for pid in all_ids]
+        results = await asyncio.gather(*tasks)
+        avatars = {pid: results[i] for i, pid in enumerate(all_ids)}
+        banners = {pid: results[i+len(all_ids)] for i, pid in enumerate(all_ids)}
+
+        slot_y = ct_y + 100
+        slot_h = 120
         for i, pid in enumerate(ct_ids[:5]):
-            draw.text((ct_x+30, ct_y+100+i*50), player_display_name(pid), font=font_slot, fill='white')
+            y = slot_y + i * (slot_h + 10)
+            c.execute("SELECT username FROM users WHERE user_id=?", (pid,))
+            uname = c.fetchone()
+            is_own = (pid == OWNER_ID)
+            is_adm = uname and is_admin(uname[0])
+            premium = is_premium(pid)
+            draw_player_slot(draw, ct_x+30, y, ct_w-60, slot_h, pid, get_elo(pid), get_standoff_id(pid),
+                             avatars.get(pid), banners.get(pid), is_own, is_adm, premium, compact=True)
+
         for i, pid in enumerate(t_ids[:5]):
-            draw.text((t_x+30, ct_y+100+i*50), player_display_name(pid), font=font_slot, fill='white')
+            y = slot_y + i * (slot_h + 10)
+            c.execute("SELECT username FROM users WHERE user_id=?", (pid,))
+            uname = c.fetchone()
+            is_own = (pid == OWNER_ID)
+            is_adm = uname and is_admin(uname[0])
+            premium = is_premium(pid)
+            draw_player_slot(draw, t_x+30, y, ct_w-60, slot_h, pid, get_elo(pid), get_standoff_id(pid),
+                             avatars.get(pid), banners.get(pid), is_own, is_adm, premium, compact=True)
 
         draw.text((width//2, height-50), "404hp FACEIT © 2026", font=get_font(32), fill=TEXT_GRAY, anchor="mm")
 
-        img = img.filter(ImageFilter.SHARPEN)
+        final_img = Image.new('RGB', (width, height), DARK_BG)
+        final_img.paste(img, (0,0), img)
+        final_img = final_img.filter(ImageFilter.SHARPEN)
         bio = BytesIO()
-        img.save(bio, format="PNG")
+        final_img.save(bio, format="PNG")
         bio.seek(0)
         return bio
     except Exception as e:
         logging.error(f"generate_draft_image error: {e}")
         return None
 
-# ------------------------------------------------------------
-# Обновление поста лобби
-# ------------------------------------------------------------
 async def update_lobby_post(bot: Bot, lobby_id: int):
     img_data = await generate_lobby_image(bot, lobby_id)
     if not img_data:
@@ -491,10 +696,8 @@ async def update_lobby_post(bot: Bot, lobby_id: int):
         msg = await bot.send_photo(GROUP_CHAT_ID, photo, caption=text, reply_markup=keyboard, message_thread_id=thread_id)
         c.execute("UPDATE lobbies SET message_id=? WHERE id=?", (msg.message_id, lobby_id)); conn.commit()
 
-# ------------------------------------------------------------
-# Жеребьёвка с дуо
-# ------------------------------------------------------------
 async def start_draw(bot: Bot, lobby_id: int, mode: str):
+    """Жеребьёвка с гарантированным объединением дуо-пар в одну команду."""
     c.execute("SELECT user_id FROM lobby_registrations WHERE lobby_id=?", (lobby_id,))
     players = [row[0] for row in c.fetchall()]
     if len(players) < MAX_PLAYERS[mode]:
@@ -599,10 +802,11 @@ async def start_draw(bot: Bot, lobby_id: int, mode: str):
         f"если в течении 11 минут вас не пригласили то обратитесь в тикет поддержки"
     )
     await bot.send_message(GROUP_CHAT_ID, text_draw, message_thread_id=TOPIC_DRAW)
+
     await update_lobby_post(bot, lobby_id)
 
 # ------------------------------------------------------------
-# FSM и CallbackData
+# FSM (состояния)
 # ------------------------------------------------------------
 class RegStates(StatesGroup): nick = State(); sid = State(); confirm = State()
 class AdminStates(StatesGroup):
@@ -627,6 +831,7 @@ class ProblemTicketStates(StatesGroup):
     waiting_screenshot = State()
     waiting_admin_reply = State()
 
+# CallbackData
 class ReportAction(CallbackData, prefix="report"):
     action: str
     report_id: int
@@ -637,7 +842,7 @@ class TicketAction(CallbackData, prefix="ticket"):
     user_id: int
 
 # ------------------------------------------------------------
-# Главное меню
+# Главное меню и вспомогательные клавиатуры
 # ------------------------------------------------------------
 async def main_menu_keyboard(user_id, username):
     btns = [
@@ -657,27 +862,18 @@ async def main_menu_keyboard(user_id, username):
 # ------------------------------------------------------------
 @dp.message(Command("start"))
 async def start_cmd(message: Message, state: FSMContext):
-    try:
-        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=message.from_user.id)
-        if member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.RESTRICTED]:
-            await message.answer(f"❌ Подпишитесь на {CHANNEL_USERNAME} и нажмите /start")
-            return
-    except:
-        pass
+    if not await check_subscription(bot, message.from_user.id):
+        await message.answer(f"❌ Подпишитесь на {CHANNEL_USERNAME} и нажмите /start"); return
     if is_registered(message.from_user.id):
         if is_banned(message.from_user.id):
             await message.answer("❌ Вы забанены в боте.")
             return
-        await message.answer("Главное меню:", reply_markup=await main_menu_keyboard(message.from_user.id, message.from_user.username))
-        return
-    await message.answer("Введите игровой никнейм из Standoff 2:")
-    await state.set_state(RegStates.nick)
+        await message.answer("Главное меню:", reply_markup=await main_menu_keyboard(message.from_user.id, message.from_user.username)); return
+    await message.answer("Введите игровой никнейм из Standoff 2:"); await state.set_state(RegStates.nick)
 
 @dp.message(RegStates.nick)
 async def reg_nick(message: Message, state: FSMContext):
-    await state.update_data(nick=message.text.strip())
-    await message.answer("Введите ваш ID из Standoff 2:")
-    await state.set_state(RegStates.sid)
+    await state.update_data(nick=message.text.strip()); await message.answer("Введите ваш ID из Standoff 2:"); await state.set_state(RegStates.sid)
 
 @dp.message(RegStates.sid)
 async def reg_sid(message: Message, state: FSMContext):
@@ -692,15 +888,13 @@ async def reg_sid(message: Message, state: FSMContext):
 @dp.callback_query(RegStates.confirm, F.data.startswith("reg_"))
 async def reg_confirm(query: CallbackQuery, state: FSMContext):
     if query.data == "reg_confirm":
-        user = query.from_user
-        data = await state.get_data()
+        user = query.from_user; data = await state.get_data()
         c.execute("INSERT OR REPLACE INTO users (user_id, username, nickname, standoff_id, elo, wins, losses, registered) VALUES (?,?,?,?,0,0,0,1)",
                   (user.id, user.username or "", data['nick'], data['sid']))
         conn.commit()
         await query.message.edit_text("Регистрация успешна! ✅")
         await query.message.answer("Главное меню:", reply_markup=await main_menu_keyboard(user.id, user.username))
-    else:
-        await query.message.edit_text("Регистрация отменена.")
+    else: await query.message.edit_text("Регистрация отменена.")
     await state.clear()
 
 # Профиль
@@ -726,9 +920,9 @@ async def profile(query: CallbackQuery, bot: Bot):
         f"[🏆] Victory: {wins} ({winrate:.1f}%)\n"
         f"[❌] Defeat: {losses}"
     )
-    avatar_cache[user_id] = await get_avatar_image_cached(bot, user_id)
-    banner_cache[user_id] = await get_banner_cached(bot, user_id)
-    card = generate_profile_card(user_id, username)
+    cached_av = await get_avatar_image_cached(bot, user_id)
+    cached_bn = await get_banner_cached(bot, user_id)
+    card = generate_profile_card(user_id, username=username, cached_avatar=cached_av, cached_banner=cached_bn)
     photo = BufferedInputFile(card.read(), filename="profile.png")
     profile_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏞️ Загрузить аватар", callback_data="set_avatar"),
@@ -853,6 +1047,87 @@ async def duo_invite(query: CallbackQuery, state: FSMContext):
     await state.set_state(DuoStates.waiting_nickname)
     await query.message.edit_text("[👤] Отправьте nickname друга, с которым вы хотите быть в одной команде:")
 
+@dp.message(Command("playduo"))
+async def cmd_playduo(message: Message, state: FSMContext, bot: Bot):
+    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
+    await message.answer("[👤] Отправьте nickname друга, с которым вы хотите быть в одной команде:")
+    await state.set_state(DuoStates.waiting_nickname)
+
+@dp.message(DuoStates.waiting_nickname)
+async def duo_nickname(message: Message, state: FSMContext, bot: Bot):
+    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
+    friend_nick = message.text.strip()
+    if not friend_nick:
+        await message.answer("Никнейм не может быть пустым.")
+        return
+    user_id = message.from_user.id
+    c.execute("SELECT user_id FROM users WHERE nickname=?", (friend_nick,))
+    friend_row = c.fetchone()
+    if not friend_row:
+        await message.answer("Пользователь с таким никнеймом не найден в системе.")
+        await state.clear()
+        return
+    friend_id = friend_row[0]
+    if friend_id == user_id:
+        await message.answer("Нельзя добавить себя в дуо.")
+        await state.clear()
+        return
+
+    if not is_registered(friend_id):
+        await message.answer("Пользователь ещё не зарегистрирован в боте. Ему нужно написать /start.")
+        await state.clear()
+        return
+
+    c.execute("INSERT OR REPLACE INTO duo_requests (sender_id, receiver_id) VALUES (?, ?)", (user_id, friend_id))
+    conn.commit()
+
+    sender_nick = get_nickname(user_id)
+    try:
+        await bot.send_message(
+            friend_id,
+            f"💌 Игрок {sender_nick} хочет быть с вами в DUO.\n"
+            f"Примите или отклоните запрос:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Принять", callback_data=f"duo_accept_{user_id}")],
+                [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"duo_decline_{user_id}")],
+            ])
+        )
+        await message.answer(f"Запрос отправлен игроку {friend_nick}.")
+    except Exception as e:
+        await message.answer("Не удалось отправить запрос. Убедитесь, что пользователь начал диалог с ботом.")
+        logging.error(f"Ошибка отправки дуо-запроса: {e}")
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("duo_accept_"))
+async def duo_accept(query: CallbackQuery, bot: Bot):
+    sender_id = int(query.data.split("_")[-1])
+    receiver_id = query.from_user.id
+    c.execute("SELECT * FROM duo_requests WHERE sender_id=? AND receiver_id=?", (sender_id, receiver_id))
+    if not c.fetchone():
+        await query.answer("Запрос уже недействителен.")
+        return
+
+    sender_nick = get_nickname(sender_id)
+    receiver_nick = get_nickname(receiver_id)
+    c.execute("INSERT OR REPLACE INTO duos (user_id, friend_nickname) VALUES (?, ?)", (sender_id, receiver_nick))
+    c.execute("INSERT OR REPLACE INTO duos (user_id, friend_nickname) VALUES (?, ?)", (receiver_id, sender_nick))
+    conn.commit()
+
+    c.execute("DELETE FROM duo_requests WHERE sender_id=? AND receiver_id=?", (sender_id, receiver_id))
+    conn.commit()
+
+    await query.message.edit_text(f"✅ Вы приняли запрос на DUO с игроком {sender_nick}.")
+    await bot.send_message(sender_id, f"✅ {receiver_nick} принял ваш запрос на DUO!")
+
+@dp.callback_query(F.data.startswith("duo_decline_"))
+async def duo_decline(query: CallbackQuery, bot: Bot):
+    sender_id = int(query.data.split("_")[-1])
+    receiver_id = query.from_user.id
+    c.execute("DELETE FROM duo_requests WHERE sender_id=? AND receiver_id=?", (sender_id, receiver_id))
+    conn.commit()
+    await query.message.edit_text("❌ Вы отклонили запрос на DUO.")
+    await bot.send_message(sender_id, f"❌ Игрок отказался от дуо.")
+
 # Поиск лобби
 @dp.callback_query(F.data == "menu_search")
 async def search_mode_menu(query: CallbackQuery):
@@ -947,7 +1222,7 @@ async def admin_reset_all_lobbies(query: CallbackQuery, bot: Bot):
         c.execute("SELECT id FROM lobbies")
         all_lobbies = [row[0] for row in c.fetchall()]
         for lid in all_lobbies:
-            new_map = random.choice(list(MAP_URLS.keys())) if MAP_URLS else None
+            new_map = random.choice(list(map_images_cache.keys())) if map_images_cache else None
             c.execute("UPDATE lobbies SET message_id=NULL, map_name=? WHERE id=?", (new_map, lid))
         conn.commit()
         await restore_all_lobby_posts()
@@ -999,12 +1274,156 @@ async def admin_reset_lobby(query: CallbackQuery, bot: Bot):
     lobby_id = int(query.data.split("_")[-1])
     if not is_admin(query.from_user.username): await query.answer("Нет доступа."); return
     c.execute("DELETE FROM lobby_registrations WHERE lobby_id=?", (lobby_id,))
-    new_map = random.choice(list(MAP_URLS.keys())) if MAP_URLS else None
+    new_map = random.choice(list(map_images_cache.keys())) if map_images_cache else None
     c.execute("UPDATE lobbies SET map_name=? WHERE id=?", (new_map, lobby_id))
     conn.commit()
     await update_lobby_post(bot, lobby_id); await query.answer("Игроки сброшены, карта обновлена.")
 
+# ------------------------------------------------------------
+# АДМИНСКОЕ УПРАВЛЕНИЕ ЛОББИ (все лобби)
+# ------------------------------------------------------------
+@dp.callback_query(F.data == "admin_manage_lobby")
+async def admin_manage_lobby_list(query: CallbackQuery):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    c.execute("SELECT id, mode, thread_id FROM lobbies")
+    lobbies = c.fetchall()
+    if not lobbies:
+        await query.answer("Нет созданных лобби.", show_alert=True)
+        return
+    buttons = []
+    for lid, mode, tid in lobbies:
+        c.execute("SELECT COUNT(*) FROM lobby_registrations WHERE lobby_id=?", (lid,))
+        cnt = c.fetchone()[0]
+        buttons.append([InlineKeyboardButton(text=f"Лобби {lid} ({mode}) – {cnt} игроков", callback_data=f"admin_mng_lobby_{lid}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_admin")])
+    await query.message.edit_text("Выберите лобби для управления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("admin_mng_lobby_"))
+async def admin_mng_lobby_actions(query: CallbackQuery):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    lobby_id = int(query.data.split("_")[-1])
+    c.execute("SELECT mode, thread_id FROM lobbies WHERE id=?", (lobby_id,))
+    lobby = c.fetchone()
+    if not lobby:
+        await query.answer("Лобби не найдено.")
+        return
+    mode = lobby[0]
+
+    buttons = [
+        [InlineKeyboardButton(text="👥 Кикнуть игрока", callback_data=f"admin_mng_kick_menu_{lobby_id}")],
+        [InlineKeyboardButton(text="🔄 Заменить игрока", callback_data=f"admin_mng_replace_menu_{lobby_id}")],
+    ]
+
+    c.execute("SELECT id FROM matches WHERE lobby_id=? AND status='drawn'", (lobby_id,))
+    match = c.fetchone()
+    if match:
+        match_id = match[0]
+        buttons.append([InlineKeyboardButton(text="📊 Зарегистрировать результаты за хоста", callback_data=f"admin_mng_results_{match_id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_manage_lobby")])
+    await query.message.edit_text(f"Управление лобби {lobby_id} ({mode}):", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("admin_mng_kick_menu_"))
+async def admin_mng_kick_menu(query: CallbackQuery):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    lobby_id = int(query.data.split("_")[-1])
+    players = get_players_in_lobby(lobby_id)
+    if not players:
+        await query.answer("В лобби нет игроков.")
+        return
+    buttons = []
+    for uid, nick in players:
+        display = player_display_name(uid)
+        buttons.append([InlineKeyboardButton(text=f"Кикнуть {display}", callback_data=f"admin_mng_kick_{lobby_id}_{uid}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"admin_mng_lobby_{lobby_id}")])
+    await query.message.edit_text("Выберите игрока для кика:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("admin_mng_kick_"))
+async def admin_mng_kick_exec(query: CallbackQuery, bot: Bot):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    _, _, _, lobby_id_str, user_id_str = query.data.split("_")
+    lobby_id = int(lobby_id_str)
+    user_id = int(user_id_str)
+    remove_player_from_lobby(lobby_id, user_id)
+    await update_lobby_post(bot, lobby_id)
+    await query.answer(f"Игрок {player_display_name(user_id)} удалён.")
+    await admin_mng_kick_menu(query)
+
+@dp.callback_query(F.data.startswith("admin_mng_replace_menu_"))
+async def admin_mng_replace_menu(query: CallbackQuery):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    lobby_id = int(query.data.split("_")[-1])
+    players = get_players_in_lobby(lobby_id)
+    if not players:
+        await query.answer("В лобби нет игроков.")
+        return
+    buttons = []
+    for uid, nick in players:
+        display = player_display_name(uid)
+        buttons.append([InlineKeyboardButton(text=f"Заменить {display}", callback_data=f"admin_mng_replace_{lobby_id}_{uid}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"admin_mng_lobby_{lobby_id}")])
+    await query.message.edit_text("Выберите игрока для замены:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("admin_mng_replace_"))
+async def admin_mng_replace_prompt(query: CallbackQuery, state: FSMContext):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    _, _, _, lobby_id_str, user_id_str = query.data.split("_")
+    lobby_id = int(lobby_id_str)
+    old_user_id = int(user_id_str)
+    await state.update_data(replace_lobby_id=lobby_id, replace_old_user_id=old_user_id)
+    await query.message.edit_text("Введите @username нового игрока:")
+    await state.set_state(AdminStates.waiting_replace_new_user)
+
+@dp.message(AdminStates.waiting_replace_new_user)
+async def admin_mng_replace_exec(message: Message, state: FSMContext, bot: Bot):
+    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
+    identifier = message.text.strip()
+    target_id = find_user(identifier)
+    if not target_id:
+        await message.answer("Пользователь не найден.")
+        return
+
+    data = await state.get_data()
+    lobby_id = data["replace_lobby_id"]
+    old_user_id = data["replace_old_user_id"]
+
+    if not add_player_to_lobby(lobby_id, target_id):
+        await message.answer("Не удалось добавить игрока (возможно, он забанен или уже в лобби).")
+        return
+
+    remove_player_from_lobby(lobby_id, old_user_id)
+    await update_lobby_post(bot, lobby_id)
+    await message.answer(f"Игрок {player_display_name(old_user_id)} заменён на {player_display_name(target_id)}.")
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("admin_mng_results_"))
+async def admin_mng_results_start(query: CallbackQuery, state: FSMContext):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    match_id = int(query.data.split("_")[-1])
+    match = get_match_info(match_id)
+    if not match or match[6] != 'drawn':
+        await query.answer("Матч не найден или уже не активен.")
+        return
+    await state.update_data(match_id=match_id)
+    await query.message.edit_text("📸 Отправьте скриншот результатов:")
+    await state.set_state(ResultStates.waiting_screenshot)
+
+# ------------------------------------------------------------
 # Пользователи и баны
+# ------------------------------------------------------------
 @dp.callback_query(F.data == "admin_list")
 async def admin_list(query: CallbackQuery):
     if not is_owner_of_menu(query):
@@ -1133,6 +1552,19 @@ async def admin_gameban(query: CallbackQuery):
     await query.answer("Игры запрещены." if new else "Игры разрешены.")
     await admin_user(query)
 
+@dp.callback_query(F.data.startswith("admin_badge_"))
+async def admin_set_badge(query: CallbackQuery):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    _, _, uid, badge = query.data.split("_")
+    uid = int(uid)
+    if badge == "none":
+        badge = ""
+    set_user_badge(uid, badge)
+    await query.answer("Бейдж обновлён.")
+    await admin_user(query)
+
 # Управление админами
 @dp.callback_query(F.data == "admin_manage")
 async def admin_manage_menu(query: CallbackQuery):
@@ -1185,7 +1617,9 @@ async def process_admin_remove(message: Message, state: FSMContext):
     c.execute("DELETE FROM admins WHERE username=?", (raw,)); conn.commit()
     await message.answer(f"❌ @{raw} удалён из администраторов."); await state.clear()
 
+# ------------------------------------------------------------
 # Лидерборд
+# ------------------------------------------------------------
 @dp.callback_query(F.data == "menu_leaderboard")
 async def leaderboard(query: CallbackQuery):
     if not is_owner_of_menu(query):
@@ -1198,7 +1632,9 @@ async def leaderboard(query: CallbackQuery):
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]]))
 
+# ------------------------------------------------------------
 # Тикеты
+# ------------------------------------------------------------
 @dp.callback_query(F.data == "menu_ticket")
 async def ticket_menu(query: CallbackQuery):
     if not is_owner_of_menu(query):
@@ -1557,7 +1993,9 @@ async def report_callback_handler(query: CallbackQuery, callback_data: ReportAct
     await query.message.edit_reply_markup(reply_markup=None)
     await query.message.edit_text(query.message.text + "\n\n✅ Жалоба обработана.")
 
+# ------------------------------------------------------------
 # Назад
+# ------------------------------------------------------------
 @dp.callback_query(F.data == "menu_back")
 async def back_to_menu(query: CallbackQuery):
     if not is_owner_of_menu(query):
@@ -1572,7 +2010,9 @@ async def back_to_menu(query: CallbackQuery):
             pass
         await bot.send_message(chat_id=query.from_user.id, text="Главное меню:", reply_markup=await main_menu_keyboard(query.from_user.id, query.from_user.username))
 
+# ------------------------------------------------------------
 # Результаты /results
+# ------------------------------------------------------------
 @dp.message(Command("results"))
 async def cmd_results(message: Message, state: FSMContext):
     if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
@@ -1687,89 +2127,9 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
     await message.answer("Результат сохранён и отправлен в тему результатов.")
     await state.clear()
 
-# /playduo
-@dp.message(Command("playduo"))
-async def cmd_playduo(message: Message, state: FSMContext, bot: Bot):
-    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
-    await message.answer("[👤] Отправьте nickname друга, с которым вы хотите быть в одной команде:")
-    await state.set_state(DuoStates.waiting_nickname)
-
-@dp.message(DuoStates.waiting_nickname)
-async def duo_nickname(message: Message, state: FSMContext, bot: Bot):
-    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
-    friend_nick = message.text.strip()
-    if not friend_nick:
-        await message.answer("Никнейм не может быть пустым.")
-        return
-    user_id = message.from_user.id
-    c.execute("SELECT user_id FROM users WHERE nickname=?", (friend_nick,))
-    friend_row = c.fetchone()
-    if not friend_row:
-        await message.answer("Пользователь с таким никнеймом не найден в системе.")
-        await state.clear()
-        return
-    friend_id = friend_row[0]
-    if friend_id == user_id:
-        await message.answer("Нельзя добавить себя в дуо.")
-        await state.clear()
-        return
-
-    if not is_registered(friend_id):
-        await message.answer("Пользователь ещё не зарегистрирован в боте. Ему нужно написать /start.")
-        await state.clear()
-        return
-
-    c.execute("INSERT OR REPLACE INTO duo_requests (sender_id, receiver_id) VALUES (?, ?)", (user_id, friend_id))
-    conn.commit()
-
-    sender_nick = get_nickname(user_id)
-    try:
-        await bot.send_message(
-            friend_id,
-            f"💌 Игрок {sender_nick} хочет быть с вами в DUO.\n"
-            f"Примите или отклоните запрос:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Принять", callback_data=f"duo_accept_{user_id}")],
-                [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"duo_decline_{user_id}")],
-            ])
-        )
-        await message.answer(f"Запрос отправлен игроку {friend_nick}.")
-    except Exception as e:
-        await message.answer("Не удалось отправить запрос. Убедитесь, что пользователь начал диалог с ботом.")
-        logging.error(f"Ошибка отправки дуо-запроса: {e}")
-    await state.clear()
-
-@dp.callback_query(F.data.startswith("duo_accept_"))
-async def duo_accept(query: CallbackQuery, bot: Bot):
-    sender_id = int(query.data.split("_")[-1])
-    receiver_id = query.from_user.id
-    c.execute("SELECT * FROM duo_requests WHERE sender_id=? AND receiver_id=?", (sender_id, receiver_id))
-    if not c.fetchone():
-        await query.answer("Запрос уже недействителен.")
-        return
-
-    sender_nick = get_nickname(sender_id)
-    receiver_nick = get_nickname(receiver_id)
-    c.execute("INSERT OR REPLACE INTO duos (user_id, friend_nickname) VALUES (?, ?)", (sender_id, receiver_nick))
-    c.execute("INSERT OR REPLACE INTO duos (user_id, friend_nickname) VALUES (?, ?)", (receiver_id, sender_nick))
-    conn.commit()
-
-    c.execute("DELETE FROM duo_requests WHERE sender_id=? AND receiver_id=?", (sender_id, receiver_id))
-    conn.commit()
-
-    await query.message.edit_text(f"✅ Вы приняли запрос на DUO с игроком {sender_nick}.")
-    await bot.send_message(sender_id, f"✅ {receiver_nick} принял ваш запрос на DUO!")
-
-@dp.callback_query(F.data.startswith("duo_decline_"))
-async def duo_decline(query: CallbackQuery, bot: Bot):
-    sender_id = int(query.data.split("_")[-1])
-    receiver_id = query.from_user.id
-    c.execute("DELETE FROM duo_requests WHERE sender_id=? AND receiver_id=?", (sender_id, receiver_id))
-    conn.commit()
-    await query.message.edit_text("❌ Вы отклонили запрос на DUO.")
-    await bot.send_message(sender_id, f"❌ Игрок отказался от дуо.")
-
-# Мои лобби
+# ------------------------------------------------------------
+# Мои лобби (для обычных пользователей)
+# ------------------------------------------------------------
 @dp.callback_query(F.data == "my_lobbies")
 async def my_lobbies(query: CallbackQuery):
     if not is_owner_of_menu(query):
@@ -1889,160 +2249,6 @@ async def admin_cancel_match_handler(query: CallbackQuery, bot: Bot):
     cancel_match(match_id)
     await query.message.edit_text(query.message.text + "\n\n✅ Матч отменён.")
     await query.answer("Матч отменён.")
-
-# Админ: управление lobby
-@dp.callback_query(F.data == "admin_manage_lobby")
-async def admin_manage_lobby_list(query: CallbackQuery):
-    if not is_owner_of_menu(query):
-        await query.answer("Это меню другого пользователя.", show_alert=True)
-        return
-    c.execute("SELECT id, mode, thread_id FROM lobbies")
-    lobbies = c.fetchall()
-    if not lobbies:
-        await query.answer("Нет созданных лобби.", show_alert=True)
-        return
-    buttons = []
-    for lid, mode, tid in lobbies:
-        c.execute("SELECT COUNT(*) FROM lobby_registrations WHERE lobby_id=?", (lid,))
-        cnt = c.fetchone()[0]
-        buttons.append([InlineKeyboardButton(text=f"Лобби {lid} ({mode}) – {cnt} игроков", callback_data=f"admin_mng_lobby_{lid}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_admin")])
-    await query.message.edit_text("Выберите лобби для управления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-@dp.callback_query(F.data.startswith("admin_mng_lobby_"))
-async def admin_mng_lobby_actions(query: CallbackQuery):
-    if not is_owner_of_menu(query):
-        await query.answer("Это меню другого пользователя.", show_alert=True)
-        return
-    lobby_id = int(query.data.split("_")[-1])
-    c.execute("SELECT mode, thread_id FROM lobbies WHERE id=?", (lobby_id,))
-    lobby = c.fetchone()
-    if not lobby:
-        await query.answer("Лобби не найдено.")
-        return
-    mode = lobby[0]
-
-    buttons = [
-        [InlineKeyboardButton(text="👥 Кикнуть игрока", callback_data=f"admin_mng_kick_menu_{lobby_id}")],
-        [InlineKeyboardButton(text="🔄 Заменить игрока", callback_data=f"admin_mng_replace_menu_{lobby_id}")],
-    ]
-
-    c.execute("SELECT id FROM matches WHERE lobby_id=? AND status='drawn'", (lobby_id,))
-    match = c.fetchone()
-    if match:
-        match_id = match[0]
-        buttons.append([InlineKeyboardButton(text="📊 Зарегистрировать результаты за хоста", callback_data=f"admin_mng_results_{match_id}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_manage_lobby")])
-    await query.message.edit_text(f"Управление лобби {lobby_id} ({mode}):", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-@dp.callback_query(F.data.startswith("admin_mng_kick_menu_"))
-async def admin_mng_kick_menu(query: CallbackQuery):
-    if not is_owner_of_menu(query):
-        await query.answer("Это меню другого пользователя.", show_alert=True)
-        return
-    lobby_id = int(query.data.split("_")[-1])
-    players = get_players_in_lobby(lobby_id)
-    if not players:
-        await query.answer("В лобби нет игроков.")
-        return
-    buttons = []
-    for uid, nick in players:
-        display = player_display_name(uid)
-        buttons.append([InlineKeyboardButton(text=f"Кикнуть {display}", callback_data=f"admin_mng_kick_{lobby_id}_{uid}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"admin_mng_lobby_{lobby_id}")])
-    await query.message.edit_text("Выберите игрока для кика:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-@dp.callback_query(F.data.startswith("admin_mng_kick_"))
-async def admin_mng_kick_exec(query: CallbackQuery, bot: Bot):
-    if not is_owner_of_menu(query):
-        await query.answer("Это меню другого пользователя.", show_alert=True)
-        return
-    _, _, _, lobby_id_str, user_id_str = query.data.split("_")
-    lobby_id = int(lobby_id_str)
-    user_id = int(user_id_str)
-    remove_player_from_lobby(lobby_id, user_id)
-    await update_lobby_post(bot, lobby_id)
-    await query.answer(f"Игрок {player_display_name(user_id)} удалён.")
-    await admin_mng_kick_menu(query)
-
-@dp.callback_query(F.data.startswith("admin_mng_replace_menu_"))
-async def admin_mng_replace_menu(query: CallbackQuery):
-    if not is_owner_of_menu(query):
-        await query.answer("Это меню другого пользователя.", show_alert=True)
-        return
-    lobby_id = int(query.data.split("_")[-1])
-    players = get_players_in_lobby(lobby_id)
-    if not players:
-        await query.answer("В лобби нет игроков.")
-        return
-    buttons = []
-    for uid, nick in players:
-        display = player_display_name(uid)
-        buttons.append([InlineKeyboardButton(text=f"Заменить {display}", callback_data=f"admin_mng_replace_{lobby_id}_{uid}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"admin_mng_lobby_{lobby_id}")])
-    await query.message.edit_text("Выберите игрока для замены:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-@dp.callback_query(F.data.startswith("admin_mng_replace_"))
-async def admin_mng_replace_prompt(query: CallbackQuery, state: FSMContext):
-    if not is_owner_of_menu(query):
-        await query.answer("Это меню другого пользователя.", show_alert=True)
-        return
-    _, _, _, lobby_id_str, user_id_str = query.data.split("_")
-    lobby_id = int(lobby_id_str)
-    old_user_id = int(user_id_str)
-    await state.update_data(replace_lobby_id=lobby_id, replace_old_user_id=old_user_id)
-    await query.message.edit_text("Введите @username нового игрока:")
-    await state.set_state(AdminStates.waiting_replace_new_user)
-
-@dp.message(AdminStates.waiting_replace_new_user)
-async def admin_mng_replace_exec(message: Message, state: FSMContext, bot: Bot):
-    if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
-    identifier = message.text.strip()
-    target_id = find_user(identifier)
-    if not target_id:
-        await message.answer("Пользователь не найден.")
-        return
-
-    data = await state.get_data()
-    lobby_id = data["replace_lobby_id"]
-    old_user_id = data["replace_old_user_id"]
-
-    if not add_player_to_lobby(lobby_id, target_id):
-        await message.answer("Не удалось добавить игрока (возможно, он забанен или уже в лобби).")
-        return
-
-    remove_player_from_lobby(lobby_id, old_user_id)
-    await update_lobby_post(bot, lobby_id)
-    await message.answer(f"Игрок {player_display_name(old_user_id)} заменён на {player_display_name(target_id)}.")
-    await state.clear()
-
-@dp.callback_query(F.data.startswith("admin_mng_results_"))
-async def admin_mng_results_start(query: CallbackQuery, state: FSMContext):
-    if not is_owner_of_menu(query):
-        await query.answer("Это меню другого пользователя.", show_alert=True)
-        return
-    match_id = int(query.data.split("_")[-1])
-    match = get_match_info(match_id)
-    if not match or match[6] != 'drawn':
-        await query.answer("Матч не найден или уже не активен.")
-        return
-    await state.update_data(match_id=match_id)
-    await query.message.edit_text("📸 Отправьте скриншот результатов:")
-    await state.set_state(ResultStates.waiting_screenshot)
-
-# Админ-бейджи
-@dp.callback_query(F.data.startswith("admin_badge_"))
-async def admin_set_badge(query: CallbackQuery):
-    if not is_owner_of_menu(query):
-        await query.answer("Это меню другого пользователя.", show_alert=True)
-        return
-    _, _, uid, badge = query.data.split("_")
-    uid = int(uid)
-    if badge == "none":
-        badge = ""
-    set_user_badge(uid, badge)
-    await query.answer("Бейдж обновлён.")
-    await admin_user(query)
 
 # ------------------------------------------------------------
 # АДМИН: Управление результатами
@@ -2226,7 +2432,7 @@ def init_lobbies():
     for mode, tid in [("5x5",18),("5x5",20),("2x2",12),("2x2",13),("1x1",10),("1x1",2)]:
         c.execute("SELECT id FROM lobbies WHERE mode=? AND thread_id=?", (mode, tid))
         if not c.fetchone():
-            map_name = random.choice(list(MAP_URLS.keys())) if MAP_URLS else None
+            map_name = random.choice(list(map_images_cache.keys())) if map_images_cache else None
             c.execute("INSERT OR IGNORE INTO lobbies (mode, thread_id, map_name) VALUES (?,?,?)", (mode, tid, map_name))
     conn.commit()
 
@@ -2243,9 +2449,9 @@ async def restore_all_lobby_posts():
 async def main():
     global bot
     init_db()
-    # Загрузка карт при старте
-    for name in MAP_URLS:
-        download_map_image(name)
+    download_font()
+    download_default_banner()
+    load_map_images()
     init_lobbies()
 
     bot = Bot(token=TOKEN)
@@ -2255,4 +2461,4 @@ async def main():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+    asyncio.run(main())о
