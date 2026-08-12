@@ -59,6 +59,9 @@ avatar_cache = {}
 banner_cache = {}
 last_report_time = {}
 
+# Хранение актуальных сообщений меню для каждого пользователя
+menu_messages: dict[int, Message] = {}
+
 # ------------------------------------------------------------
 # Вспомогательные функции (изображения, загрузка ресурсов)
 # ------------------------------------------------------------
@@ -202,7 +205,7 @@ async def get_banner_cached(bot: Bot, user_id: int) -> Optional[Image.Image]:
     return img
 
 # ------------------------------------------------------------
-# Форматирование имени с username
+# Форматирование имени с username (для жеребьёвки, админки)
 # ------------------------------------------------------------
 def player_display_name(user_id):
     """Возвращает 'nick (@username)' или 'nick' если username отсутствует."""
@@ -214,8 +217,13 @@ def player_display_name(user_id):
     return nick
 
 def is_owner_of_menu(query: CallbackQuery) -> bool:
-    """Проверяет, что сообщение с кнопками находится в ЛС с пользователем."""
-    return query.message.chat.id == query.from_user.id
+    """Проверяет, что колбэк вызван владельцем меню и сообщение совпадает с сохранённым."""
+    user_id = query.from_user.id
+    if user_id not in menu_messages:
+        return False
+    saved_msg = menu_messages[user_id]
+    return (query.message.message_id == saved_msg.message_id and
+            query.message.chat.id == saved_msg.chat.id)
 
 # ------------------------------------------------------------
 # Генерация профиля и слотов
@@ -329,7 +337,8 @@ def generate_profile_card(user_id: int, username: Optional[str] = None,
     return bio
 
 def draw_player_slot(draw, x, y, w, h, user_id, elo, sid, avatar=None, banner=None,
-                     is_owner=False, is_admin=False, premium=False, compact=False):
+                     is_owner=False, is_admin=False, premium=False, compact=False,
+                     show_username=True):
     try:
         if compact:
             avatar_r = 40
@@ -387,7 +396,10 @@ def draw_player_slot(draw, x, y, w, h, user_id, elo, sid, avatar=None, banner=No
             draw.ellipse([avatar_cx-avatar_r, avatar_cy-avatar_r, avatar_cx+avatar_r, avatar_cy+avatar_r],
                          fill=(35,38,55), outline=FACEIT_ORANGE, width=3)
 
-        display_name = player_display_name(user_id)
+        if show_username:
+            display_name = player_display_name(user_id)
+        else:
+            display_name = get_nickname(user_id)
 
         font_size = base_font_size
         font_nick = get_font(font_size)
@@ -519,7 +531,8 @@ async def generate_lobby_image(bot: Bot, lobby_id: int) -> Optional[BytesIO]:
                 is_own = (pid == OWNER_ID)
                 is_adm = uname and is_admin(uname[0])
                 premium = is_premium(pid)
-                draw_player_slot(draw, x, y, slot_w, slot_h, pid, elo, sid, av, bn, is_own, is_adm, premium)
+                draw_player_slot(draw, x, y, slot_w, slot_h, pid, elo, sid, av, bn, is_own, is_adm, premium,
+                                 show_username=False)   # <-- БЕЗ username
             else:
                 draw.rounded_rectangle([x, y, x+slot_w, y+slot_h], radius=18, fill=(255,255,255,12), outline=(255,255,255,40))
                 font_wait = get_font(32)
@@ -587,7 +600,7 @@ async def generate_draft_image(bot, lobby_id, mode, ct_ids, t_ids, map_name, mat
             draw.rounded_rectangle([center_x+40,map_y,center_x+center_w-40,map_y+340], radius=8, fill=(30,35,45))
             draw.text((center_x+center_w//2,map_y+170), "NO MAP", font=get_font(48), fill=TEXT_GRAY, anchor="mm")
 
-        host_text = f"👑 Хост: {player_display_name(host_id)} | Матч #{match_num}"
+        host_text = f"👑 Хост: {player_display_name(host_id)} | Матч #{match_num}"   # жеребьёвка: с username
         draw.text((center_x+center_w//2, map_y+370), host_text, font=get_font(32), fill=GOLD, anchor="mt")
 
         elo_y = map_y + 420
@@ -619,7 +632,7 @@ async def generate_draft_image(bot, lobby_id, mode, ct_ids, t_ids, map_name, mat
             is_adm = uname and is_admin(uname[0])
             premium = is_premium(pid)
             draw_player_slot(draw, ct_x+30, y, ct_w-60, slot_h, pid, get_elo(pid), get_standoff_id(pid),
-                             avatars.get(pid), banners.get(pid), is_own, is_adm, premium, compact=True)
+                             avatars.get(pid), banners.get(pid), is_own, is_adm, premium, compact=True)  # по умолчанию show_username=True
 
         for i, pid in enumerate(t_ids[:5]):
             y = slot_y + i * (slot_h + 10)
@@ -651,7 +664,7 @@ async def update_lobby_post(bot: Bot, lobby_id: int):
         mode, thread_id, match_num = c.fetchone()
         c.execute("SELECT user_id FROM lobby_registrations WHERE lobby_id=?", (lobby_id,))
         players = c.fetchall()
-        lines = [f"👤 {player_display_name(p[0])} | ID {get_standoff_id(p[0])}" for p in players]
+        lines = [f"👤 {get_nickname(p[0])} | ID {get_standoff_id(p[0])}" for p in players]
         text = f"🎮 Лобби {mode} · lobby #{lobby_id} | Матч #{match_num}\nИгроки: {len(players)}/{MAX_PLAYERS[mode]}\n——————\n" + ("\n".join(lines) if lines else "Пока никого нет.") + "\n——————"
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🚪 Вступить", callback_data=f"lobby_join_{lobby_id}"),
@@ -673,7 +686,7 @@ async def update_lobby_post(bot: Bot, lobby_id: int):
     mode, thread_id, match_num = c.fetchone()
     c.execute("SELECT user_id FROM lobby_registrations WHERE lobby_id=?", (lobby_id,))
     players = c.fetchall()
-    lines = [f"👤 {player_display_name(p[0])} | ID {get_standoff_id(p[0])}" for p in players]
+    lines = [f"👤 {get_nickname(p[0])} | ID {get_standoff_id(p[0])}" for p in players]
     header = f"🎮 Лобби {mode} · lobby #{lobby_id} | Матч #{match_num}"
     text = f"{header}\nИгроки: {len(players)}/{MAX_PLAYERS[mode]}\n——————\n" + ("\n".join(lines) if lines else "Пока никого нет.") + "\n——————"
 
@@ -868,7 +881,10 @@ async def start_cmd(message: Message, state: FSMContext):
         if is_banned(message.from_user.id):
             await message.answer("❌ Вы забанены в боте.")
             return
-        await message.answer("Главное меню:", reply_markup=await main_menu_keyboard(message.from_user.id, message.from_user.username)); return
+        # Отправляем главное меню и сохраняем сообщение
+        msg = await message.answer("Главное меню:", reply_markup=await main_menu_keyboard(message.from_user.id, message.from_user.username))
+        menu_messages[message.from_user.id] = msg
+        return
     await message.answer("Введите игровой никнейм из Standoff 2:"); await state.set_state(RegStates.nick)
 
 @dp.message(RegStates.nick)
@@ -893,7 +909,11 @@ async def reg_confirm(query: CallbackQuery, state: FSMContext):
                   (user.id, user.username or "", data['nick'], data['sid']))
         conn.commit()
         await query.message.edit_text("Регистрация успешна! ✅")
-        await query.message.answer("Главное меню:", reply_markup=await main_menu_keyboard(user.id, user.username))
+        # Отправляем меню пользователю в тот же чат и сохраняем сообщение
+        msg = await bot.send_message(chat_id=user.id,
+                                     text="Главное меню:",
+                                     reply_markup=await main_menu_keyboard(user.id, user.username))
+        menu_messages[user.id] = msg
     else: await query.message.edit_text("Регистрация отменена.")
     await state.clear()
 
@@ -931,7 +951,9 @@ async def profile(query: CallbackQuery, bot: Bot):
          InlineKeyboardButton(text="🔄 Сбросить аватарку", callback_data="reset_avatar")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")],
     ])
-    await query.message.answer_photo(photo, caption=info_text, reply_markup=profile_kb)
+    # Отправляем фото с клавиатурой и сохраняем как текущее меню
+    msg = await query.message.answer_photo(photo, caption=info_text, reply_markup=profile_kb)
+    menu_messages[user_id] = msg
     await query.message.delete()
 
 @dp.callback_query(F.data == "set_avatar")
@@ -1024,7 +1046,8 @@ async def my_duo(query: CallbackQuery):
             [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")],
         ])
 
-    await query.message.edit_text(text, reply_markup=keyboard)
+    msg = await query.message.edit_text(text, reply_markup=keyboard)
+    menu_messages[user_id] = msg
 
 @dp.callback_query(F.data == "duo_cancel")
 async def duo_cancel(query: CallbackQuery):
@@ -1045,7 +1068,8 @@ async def duo_invite(query: CallbackQuery, state: FSMContext):
     if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
 
     await state.set_state(DuoStates.waiting_nickname)
-    await query.message.edit_text("[👤] Отправьте nickname друга, с которым вы хотите быть в одной команде:")
+    msg = await query.message.edit_text("[👤] Отправьте nickname друга, с которым вы хотите быть в одной команде:")
+    menu_messages[query.from_user.id] = msg
 
 @dp.message(Command("playduo"))
 async def cmd_playduo(message: Message, state: FSMContext, bot: Bot):
@@ -1135,11 +1159,12 @@ async def search_mode_menu(query: CallbackQuery):
         await query.answer("Это меню другого пользователя.", show_alert=True)
         return
     if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
-    await query.message.edit_text("Выберите режим для поиска лобби:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    msg = await query.message.edit_text("Выберите режим для поиска лобби:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="5x5", callback_data="search_5x5")],
         [InlineKeyboardButton(text="2x2", callback_data="search_2x2")],
         [InlineKeyboardButton(text="1x1", callback_data="search_1x1")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]]))
+    menu_messages[query.from_user.id] = msg
 
 @dp.callback_query(F.data.startswith("search_"))
 async def show_lobbies_by_mode(query: CallbackQuery):
@@ -1157,7 +1182,8 @@ async def show_lobbies_by_mode(query: CallbackQuery):
         cnt = c.fetchone()[0]
         buttons.append([InlineKeyboardButton(text=f"{m} лобби {lid} [{cnt}/{MAX_PLAYERS[m]}]", callback_data=f"lobby_join_{lid}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_search")])
-    await query.message.edit_text("Доступные лобби:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    msg = await query.message.edit_text("Доступные лобби:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    menu_messages[query.from_user.id] = msg
 
 # Вступление/выход из лобби
 @dp.callback_query(F.data.startswith("lobby_join_"))
@@ -1209,7 +1235,8 @@ async def admin_menu(query: CallbackQuery):
     ])
     if query.from_user.id == OWNER_ID:
         keyboard.inline_keyboard.insert(3, [InlineKeyboardButton(text="🗑 Сбросить ВСЕ лобби", callback_data="admin_reset_all_lobbies")])
-    await query.message.edit_text("Админ панель:", reply_markup=keyboard)
+    msg = await query.message.edit_text("Админ панель:", reply_markup=keyboard)
+    menu_messages[query.from_user.id] = msg
 
 @dp.callback_query(F.data == "admin_reset_all_lobbies")
 async def admin_reset_all_lobbies(query: CallbackQuery, bot: Bot):
@@ -1240,7 +1267,8 @@ async def admin_lobbies_list(query: CallbackQuery):
     c.execute("SELECT id, mode FROM lobbies"); lobbies = c.fetchall()
     buttons = [[InlineKeyboardButton(text=f"{m} лобби {lid}", callback_data=f"admin_lobby_{lid}")] for lid, m in lobbies]
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_admin")])
-    await query.message.edit_text("Выберите лобби:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    msg = await query.message.edit_text("Выберите лобби:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    menu_messages[query.from_user.id] = msg
 
 @dp.callback_query(F.data.startswith("admin_lobby_"))
 async def admin_lobby_actions(query: CallbackQuery, bot: Bot):
@@ -1250,10 +1278,11 @@ async def admin_lobby_actions(query: CallbackQuery, bot: Bot):
     if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     lobby_id = int(query.data.split("_")[-1])
     if not is_admin(query.from_user.username): await query.answer("Нет доступа."); return
-    await query.message.edit_text(f"Действия с лобби {lobby_id}:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    msg = await query.message.edit_text(f"Действия с лобби {lobby_id}:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin_refresh_{lobby_id}")],
         [InlineKeyboardButton(text="🗑 Сбросить игроков", callback_data=f"admin_reset_{lobby_id}")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_lobbies")]]))
+    menu_messages[query.from_user.id] = msg
 
 @dp.callback_query(F.data.startswith("admin_refresh_"))
 async def admin_refresh_lobby(query: CallbackQuery, bot: Bot):
@@ -1298,7 +1327,8 @@ async def admin_manage_lobby_list(query: CallbackQuery):
         cnt = c.fetchone()[0]
         buttons.append([InlineKeyboardButton(text=f"Лобби {lid} ({mode}) – {cnt} игроков", callback_data=f"admin_mng_lobby_{lid}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_admin")])
-    await query.message.edit_text("Выберите лобби для управления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    msg = await query.message.edit_text("Выберите лобби для управления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    menu_messages[query.from_user.id] = msg
 
 @dp.callback_query(F.data.startswith("admin_mng_lobby_"))
 async def admin_mng_lobby_actions(query: CallbackQuery):
@@ -1324,7 +1354,8 @@ async def admin_mng_lobby_actions(query: CallbackQuery):
         match_id = match[0]
         buttons.append([InlineKeyboardButton(text="📊 Зарегистрировать результаты за хоста", callback_data=f"admin_mng_results_{match_id}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_manage_lobby")])
-    await query.message.edit_text(f"Управление лобби {lobby_id} ({mode}):", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    msg = await query.message.edit_text(f"Управление лобби {lobby_id} ({mode}):", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    menu_messages[query.from_user.id] = msg
 
 @dp.callback_query(F.data.startswith("admin_mng_kick_menu_"))
 async def admin_mng_kick_menu(query: CallbackQuery):
@@ -1341,7 +1372,8 @@ async def admin_mng_kick_menu(query: CallbackQuery):
         display = player_display_name(uid)
         buttons.append([InlineKeyboardButton(text=f"Кикнуть {display}", callback_data=f"admin_mng_kick_{lobby_id}_{uid}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"admin_mng_lobby_{lobby_id}")])
-    await query.message.edit_text("Выберите игрока для кика:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    msg = await query.message.edit_text("Выберите игрока для кика:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    menu_messages[query.from_user.id] = msg
 
 @dp.callback_query(F.data.startswith("admin_mng_kick_"))
 async def admin_mng_kick_exec(query: CallbackQuery, bot: Bot):
@@ -1371,7 +1403,8 @@ async def admin_mng_replace_menu(query: CallbackQuery):
         display = player_display_name(uid)
         buttons.append([InlineKeyboardButton(text=f"Заменить {display}", callback_data=f"admin_mng_replace_{lobby_id}_{uid}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"admin_mng_lobby_{lobby_id}")])
-    await query.message.edit_text("Выберите игрока для замены:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    msg = await query.message.edit_text("Выберите игрока для замены:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    menu_messages[query.from_user.id] = msg
 
 @dp.callback_query(F.data.startswith("admin_mng_replace_"))
 async def admin_mng_replace_prompt(query: CallbackQuery, state: FSMContext):
@@ -1382,7 +1415,8 @@ async def admin_mng_replace_prompt(query: CallbackQuery, state: FSMContext):
     lobby_id = int(lobby_id_str)
     old_user_id = int(user_id_str)
     await state.update_data(replace_lobby_id=lobby_id, replace_old_user_id=old_user_id)
-    await query.message.edit_text("Введите @username нового игрока:")
+    msg = await query.message.edit_text("Введите @username нового игрока:")
+    menu_messages[query.from_user.id] = msg
     await state.set_state(AdminStates.waiting_replace_new_user)
 
 @dp.message(AdminStates.waiting_replace_new_user)
@@ -1418,7 +1452,8 @@ async def admin_mng_results_start(query: CallbackQuery, state: FSMContext):
         await query.answer("Матч не найден или уже не активен.")
         return
     await state.update_data(match_id=match_id)
-    await query.message.edit_text("📸 Отправьте скриншот результатов:")
+    msg = await query.message.edit_text("📸 Отправьте скриншот результатов:")
+    menu_messages[query.from_user.id] = msg
     await state.set_state(ResultStates.waiting_screenshot)
 
 # ------------------------------------------------------------
@@ -1434,7 +1469,8 @@ async def admin_list(query: CallbackQuery):
     users = c.fetchall()
     buttons = [[InlineKeyboardButton(text=f"{n} (ID:{uid})", callback_data=f"admin_user_{uid}")] for uid, n in users]
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_admin")])
-    await query.message.edit_text("Выберите пользователя:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    msg = await query.message.edit_text("Выберите пользователя:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    menu_messages[query.from_user.id] = msg
 
 @dp.callback_query(F.data.startswith("admin_user_"))
 async def admin_user(query: CallbackQuery):
@@ -1466,8 +1502,9 @@ async def admin_user(query: CallbackQuery):
         [InlineKeyboardButton(text="❌ Убрать бейдж", callback_data=f"admin_badge_{uid}_none")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_list")]
     ]
-    await query.message.edit_text(f"Пользователь: {nick} (ID: {uid})\n{status_str}",
+    msg = await query.message.edit_text(f"Пользователь: {nick} (ID: {uid})\n{status_str}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    menu_messages[query.from_user.id] = msg
 
 @dp.callback_query(F.data.startswith("admin_ban_"))
 async def admin_ban(query: CallbackQuery):
@@ -1575,10 +1612,11 @@ async def admin_manage_menu(query: CallbackQuery):
     c.execute("SELECT username FROM admins")
     admins = [row[0] for row in c.fetchall()]
     text = "Администраторы:\n" + "\n".join(f"• @{a}" for a in admins)
-    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    msg = await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить", callback_data="admin_add"),
          InlineKeyboardButton(text="➖ Удалить", callback_data="admin_remove")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_admin")]]))
+    menu_messages[query.from_user.id] = msg
 
 @dp.callback_query(F.data == "admin_add")
 async def admin_add_prompt(query: CallbackQuery, state: FSMContext):
@@ -1586,8 +1624,9 @@ async def admin_add_prompt(query: CallbackQuery, state: FSMContext):
         await query.answer("Это меню другого пользователя.", show_alert=True)
         return
     if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
-    await query.message.edit_text("Введите @username для добавления:",
+    msg = await query.message.edit_text("Введите @username для добавления:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_manage")]]))
+    menu_messages[query.from_user.id] = msg
     await state.set_state(AdminStates.waiting_add)
 
 @dp.callback_query(F.data == "admin_remove")
@@ -1596,8 +1635,9 @@ async def admin_remove_prompt(query: CallbackQuery, state: FSMContext):
         await query.answer("Это меню другого пользователя.", show_alert=True)
         return
     if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
-    await query.message.edit_text("Введите @username для удаления:",
+    msg = await query.message.edit_text("Введите @username для удаления:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_manage")]]))
+    menu_messages[query.from_user.id] = msg
     await state.set_state(AdminStates.waiting_remove)
 
 @dp.message(AdminStates.waiting_add)
@@ -1629,8 +1669,9 @@ async def leaderboard(query: CallbackQuery):
     c.execute("SELECT nickname, elo FROM users ORDER BY elo DESC LIMIT 10")
     rows = c.fetchall()
     text = "🏆 Лидерборд\n" + "\n".join(f"{i+1}. {r[0]} — {r[1]} ELO" for i, r in enumerate(rows)) if rows else "Пусто."
-    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    msg = await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")]]))
+    menu_messages[query.from_user.id] = msg
 
 # ------------------------------------------------------------
 # Тикеты
@@ -1646,7 +1687,8 @@ async def ticket_menu(query: CallbackQuery):
         [InlineKeyboardButton(text="📝 Описать свою проблему", callback_data="ticket_problem")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")],
     ])
-    await query.message.edit_text("Выберите формат поддержки:", reply_markup=keyboard)
+    msg = await query.message.edit_text("Выберите формат поддержки:", reply_markup=keyboard)
+    menu_messages[query.from_user.id] = msg
 
 @dp.callback_query(F.data == "ticket_report")
 async def ticket_report_start(query: CallbackQuery, state: FSMContext):
@@ -1655,7 +1697,8 @@ async def ticket_report_start(query: CallbackQuery, state: FSMContext):
         return
     if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     await state.clear()
-    await query.message.edit_text("👤 Введите @username или nickname нарушителя:")
+    msg = await query.message.edit_text("👤 Введите @username или nickname нарушителя:")
+    menu_messages[query.from_user.id] = msg
     await state.set_state(ReportStates.waiting_target)
 
 @dp.callback_query(F.data == "ticket_problem")
@@ -1665,7 +1708,8 @@ async def ticket_problem_start(query: CallbackQuery, state: FSMContext):
         return
     if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     await state.clear()
-    await query.message.edit_text("📝 Опишите свою проблему:")
+    msg = await query.message.edit_text("📝 Опишите свою проблему:")
+    menu_messages[query.from_user.id] = msg
     await state.set_state(ProblemTicketStates.waiting_text)
 
 @dp.message(ProblemTicketStates.waiting_text)
@@ -1686,7 +1730,8 @@ async def problem_text(message: Message, state: FSMContext):
 async def screenshot_choice(query: CallbackQuery, state: FSMContext):
     choice = query.data.split("_")[1]
     if choice == "yes":
-        await query.message.edit_text("📸 Отправьте скриншот проблемы.")
+        msg = await query.message.edit_text("📸 Отправьте скриншот проблемы.")
+        menu_messages[query.from_user.id] = msg
         await state.set_state(ProblemTicketStates.waiting_screenshot)
     else:
         await state.update_data(screenshot_file_id=None)
@@ -2001,14 +2046,17 @@ async def back_to_menu(query: CallbackQuery):
     if not is_owner_of_menu(query):
         await query.answer("Это меню другого пользователя.", show_alert=True)
         return
+    user_id = query.from_user.id
     try:
-        await query.message.edit_text("Главное меню:", reply_markup=await main_menu_keyboard(query.from_user.id, query.from_user.username))
+        msg = await query.message.edit_text("Главное меню:", reply_markup=await main_menu_keyboard(user_id, query.from_user.username))
+        menu_messages[user_id] = msg
     except:
         try:
             await query.message.delete()
         except:
             pass
-        await bot.send_message(chat_id=query.from_user.id, text="Главное меню:", reply_markup=await main_menu_keyboard(query.from_user.id, query.from_user.username))
+        msg = await bot.send_message(chat_id=query.from_user.id, text="Главное меню:", reply_markup=await main_menu_keyboard(user_id, query.from_user.username))
+        menu_messages[user_id] = msg
 
 # ------------------------------------------------------------
 # Результаты /results
@@ -2092,11 +2140,11 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
 
     c.execute("SELECT user_id, team FROM match_players WHERE match_id=? ORDER BY team, user_id", (match_id,))
     rows = c.fetchall()
-    ct_list = [(uid, player_display_name(uid), get_elo(uid)) for uid, team in rows if team == 'CT']
-    t_list = [(uid, player_display_name(uid), get_elo(uid)) for uid, team in rows if team == 'T']
+    ct_list = [(uid, get_nickname(uid), get_elo(uid)) for uid, team in rows if team == 'CT']
+    t_list = [(uid, get_nickname(uid), get_elo(uid)) for uid, team in rows if team == 'T']
 
     host_id = message.from_user.id
-    host_nick = player_display_name(host_id)
+    host_nick = get_nickname(host_id)
 
     if ct_score > t_score:
         winner = "CT"
@@ -2147,12 +2195,13 @@ async def my_lobbies(query: CallbackQuery):
         ct_ids = [row[0] for row in c.fetchall()]
         c.execute("SELECT user_id FROM match_players WHERE match_id=? AND team='T'", (match_id,))
         t_ids = [row[0] for row in c.fetchall()]
-        ct_str = ", ".join([player_display_name(pid) for pid in ct_ids])
-        t_str = ", ".join([player_display_name(pid) for pid in t_ids])
+        ct_str = ", ".join([get_nickname(pid) for pid in ct_ids])
+        t_str = ", ".join([get_nickname(pid) for pid in t_ids])
         text = f"Матч #{match_num} ({mode}) на {map_name}\n🔵 CT: {ct_str}\n🔴 T: {t_str}"
         buttons.append([InlineKeyboardButton(text=text, callback_data=f"my_match_{match_id}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")])
-    await query.message.edit_text("Ваши активные матчи:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    msg = await query.message.edit_text("Ваши активные матчи:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    menu_messages[user_id] = msg
 
 @dp.callback_query(F.data.startswith("my_match_"))
 async def my_match_detail(query: CallbackQuery):
@@ -2169,15 +2218,16 @@ async def my_match_detail(query: CallbackQuery):
     ct_ids = [row[0] for row in c.fetchall()]
     c.execute("SELECT user_id FROM match_players WHERE match_id=? AND team='T'", (match_id,))
     t_ids = [row[0] for row in c.fetchall()]
-    ct_str = ", ".join([player_display_name(pid) for pid in ct_ids])
-    t_str = ", ".join([player_display_name(pid) for pid in t_ids])
+    ct_str = ", ".join([get_nickname(pid) for pid in ct_ids])
+    t_str = ", ".join([get_nickname(pid) for pid in t_ids])
     text = f"Матч #{match_num} ({mode}) на {map_name}\n🔵 CT: {ct_str}\n🔴 T: {t_str}"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Зарегистрировать результаты", callback_data=f"my_results_{match_id}")],
         [InlineKeyboardButton(text="❌ Отменить регистрацию", callback_data=f"my_cancel_{match_id}")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="my_lobbies")],
     ])
-    await query.message.edit_text(text, reply_markup=keyboard)
+    msg = await query.message.edit_text(text, reply_markup=keyboard)
+    menu_messages[query.from_user.id] = msg
 
 @dp.callback_query(F.data.startswith("my_results_"))
 async def my_results_start(query: CallbackQuery, state: FSMContext):
@@ -2186,7 +2236,8 @@ async def my_results_start(query: CallbackQuery, state: FSMContext):
         return
     match_id = int(query.data.split("_")[-1])
     await state.update_data(match_id=match_id)
-    await query.message.edit_text("📸 Отправьте скриншот результатов:")
+    msg = await query.message.edit_text("📸 Отправьте скриншот результатов:")
+    menu_messages[query.from_user.id] = msg
     await state.set_state(ResultStates.waiting_screenshot)
 
 @dp.callback_query(F.data.startswith("my_cancel_"))
@@ -2196,7 +2247,8 @@ async def my_cancel_request(query: CallbackQuery, state: FSMContext):
         return
     match_id = int(query.data.split("_")[-1])
     await state.update_data(cancel_match_id=match_id)
-    await query.message.edit_text("📝 Введите причину отмены матча:")
+    msg = await query.message.edit_text("📝 Введите причину отмены матча:")
+    menu_messages[query.from_user.id] = msg
     await state.set_state(CancelMatchStates.waiting_reason)
 
 @dp.message(CancelMatchStates.waiting_reason)
@@ -2213,11 +2265,11 @@ async def my_cancel_reason(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
         return
     host_id = match[5]
-    host_name = player_display_name(host_id)
+    host_name = get_nickname(host_id)
     ct_ids = [row[0] for row in c.execute("SELECT user_id FROM match_players WHERE match_id=? AND team='CT'", (match_id,)).fetchall()]
     t_ids = [row[0] for row in c.execute("SELECT user_id FROM match_players WHERE match_id=? AND team='T'", (match_id,)).fetchall()]
-    ct_str = ", ".join([player_display_name(pid) for pid in ct_ids])
-    t_str = ", ".join([player_display_name(pid) for pid in t_ids])
+    ct_str = ", ".join([get_nickname(pid) for pid in ct_ids])
+    t_str = ", ".join([get_nickname(pid) for pid in t_ids])
     text = (
         f"🚨 <b>Заявка на отмену матча</b>\n"
         f"Матч #{match[2]} ({match[4]}) на {match[3]}\n"
@@ -2265,11 +2317,12 @@ async def admin_manage_results_list(query: CallbackQuery):
 
     buttons = []
     for (match_id, lobby_id, match_num, map_name, mode, host_id, score) in matches:
-        host_name = player_display_name(host_id) if host_id else "???"
+        host_name = get_nickname(host_id) if host_id else "???"
         text = f"Матч #{match_num} ({mode}) на {map_name} – {score} (хост: {host_name})"
         buttons.append([InlineKeyboardButton(text=text, callback_data=f"admin_edit_result_{match_id}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_admin")])
-    await query.message.edit_text("Выберите матч для изменения счёта:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    msg = await query.message.edit_text("Выберите матч для изменения счёта:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    menu_messages[query.from_user.id] = msg
 
 @dp.callback_query(F.data.startswith("admin_edit_result_"))
 async def admin_edit_result_prompt(query: CallbackQuery, state: FSMContext):
@@ -2283,10 +2336,11 @@ async def admin_edit_result_prompt(query: CallbackQuery, state: FSMContext):
         return
 
     await state.update_data(edit_match_id=match_id)
-    await query.message.edit_text(
+    msg = await query.message.edit_text(
         f"Текущий счёт: {match[6] if len(match) > 6 else '???'}\n"
         f"Введите новый счёт в формате: CT T (например, 13 5)"
     )
+    menu_messages[query.from_user.id] = msg
     await state.set_state(AdminStates.waiting_new_score)
 
 @dp.message(AdminStates.waiting_new_score)
@@ -2325,7 +2379,8 @@ async def admin_manage_account(query: CallbackQuery, state: FSMContext):
         return
     if is_banned(query.from_user.id): await query.answer("Вы забанены в боте.", show_alert=True); return
     if not is_admin(query.from_user.username): await query.answer("Нет доступа."); return
-    await query.message.edit_text("Введите @username или nickname игрока:")
+    msg = await query.message.edit_text("Введите @username или nickname игрока:")
+    menu_messages[query.from_user.id] = msg
     await state.set_state(ManageAccountStates.waiting_user)
 
 @dp.message(ManageAccountStates.waiting_user)
@@ -2368,19 +2423,19 @@ async def manage_account_action(query: CallbackQuery, state: FSMContext, bot: Bo
         await state.clear()
         return
     if action == "nick":
-        await query.message.edit_text("Введите новый никнейм:")
+        msg = await query.message.edit_text("Введите новый никнейм:")
         await state.update_data(action="nick")
         await state.set_state(ManageAccountStates.waiting_value)
     elif action == "sid":
-        await query.message.edit_text("Введите новый ID Standoff 2:")
+        msg = await query.message.edit_text("Введите новый ID Standoff 2:")
         await state.update_data(action="sid")
         await state.set_state(ManageAccountStates.waiting_value)
     elif action == "avatar":
-        await query.message.edit_text("Отправьте новую аватарку:")
+        msg = await query.message.edit_text("Отправьте новую аватарку:")
         await state.update_data(action="avatar")
         await state.set_state(ManageAccountStates.waiting_value)
     elif action == "banner":
-        await query.message.edit_text("Отправьте новый баннер:")
+        msg = await query.message.edit_text("Отправьте новый баннер:")
         await state.update_data(action="banner")
         await state.set_state(ManageAccountStates.waiting_value)
     elif action == "resetbanner":
@@ -2395,6 +2450,8 @@ async def manage_account_action(query: CallbackQuery, state: FSMContext, bot: Bo
         avatar_cache.pop(target_id, None)
         await query.message.edit_text("Аватарка сброшена.")
         await state.clear()
+    if action in ("nick", "sid", "avatar", "banner"):
+        menu_messages[query.from_user.id] = msg
 
 @dp.message(ManageAccountStates.waiting_value)
 async def manage_account_value(message: Message, state: FSMContext):
