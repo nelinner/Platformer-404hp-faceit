@@ -951,7 +951,6 @@ async def profile(query: CallbackQuery, bot: Bot):
          InlineKeyboardButton(text="🔄 Сбросить аватарку", callback_data="reset_avatar")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")],
     ])
-    # Отправляем фото с клавиатурой и сохраняем как текущее меню
     msg = await query.message.answer_photo(photo, caption=info_text, reply_markup=profile_kb)
     menu_messages[user_id] = msg
     await query.message.delete()
@@ -1077,7 +1076,7 @@ async def cmd_playduo(message: Message, state: FSMContext, bot: Bot):
     await message.answer("[👤] Отправьте nickname друга, с которым вы хотите быть в одной команде:")
     await state.set_state(DuoStates.waiting_nickname)
 
-@dp.message(DuoStates.waiting_nickname)
+@dp.message(DuoStates.waiting_nickname, F.text)
 async def duo_nickname(message: Message, state: FSMContext, bot: Bot):
     if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     friend_nick = message.text.strip()
@@ -1419,7 +1418,7 @@ async def admin_mng_replace_prompt(query: CallbackQuery, state: FSMContext):
     menu_messages[query.from_user.id] = msg
     await state.set_state(AdminStates.waiting_replace_new_user)
 
-@dp.message(AdminStates.waiting_replace_new_user)
+@dp.message(AdminStates.waiting_replace_new_user, F.text)
 async def admin_mng_replace_exec(message: Message, state: FSMContext, bot: Bot):
     if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     identifier = message.text.strip()
@@ -1640,7 +1639,7 @@ async def admin_remove_prompt(query: CallbackQuery, state: FSMContext):
     menu_messages[query.from_user.id] = msg
     await state.set_state(AdminStates.waiting_remove)
 
-@dp.message(AdminStates.waiting_add)
+@dp.message(AdminStates.waiting_add, F.text)
 async def process_admin_add(message: Message, state: FSMContext):
     if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     raw = message.text.strip().lstrip('@').lower()
@@ -1648,7 +1647,7 @@ async def process_admin_add(message: Message, state: FSMContext):
     c.execute("INSERT OR IGNORE INTO admins (username) VALUES (?)", (raw,)); conn.commit()
     await message.answer(f"✅ @{raw} теперь администратор."); await state.clear()
 
-@dp.message(AdminStates.waiting_remove)
+@dp.message(AdminStates.waiting_remove, F.text)
 async def process_admin_remove(message: Message, state: FSMContext):
     if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     raw = message.text.strip().lstrip('@').lower()
@@ -1712,7 +1711,7 @@ async def ticket_problem_start(query: CallbackQuery, state: FSMContext):
     menu_messages[query.from_user.id] = msg
     await state.set_state(ProblemTicketStates.waiting_text)
 
-@dp.message(ProblemTicketStates.waiting_text)
+@dp.message(ProblemTicketStates.waiting_text, F.text)  # ИСПРАВЛЕНО: добавлен F.text
 async def problem_text(message: Message, state: FSMContext):
     problem = message.text.strip()
     if not problem:
@@ -1823,7 +1822,7 @@ async def ticket_callback_handler(query: CallbackQuery, callback_data: TicketAct
         await state.set_state(ProblemTicketStates.waiting_admin_reply)
         await query.message.answer("✏️ Введите текст ответа:")
 
-@dp.message(ProblemTicketStates.waiting_admin_reply)
+@dp.message(ProblemTicketStates.waiting_admin_reply, F.text)
 async def admin_reply_text(message: Message, state: FSMContext, bot: Bot):
     reply_text = message.text.strip()
     if not reply_text:
@@ -1874,8 +1873,8 @@ async def report_command(message: Message, state: FSMContext):
     await message.answer("👤 Введите @username или nickname пользователя, на которого хотите пожаловаться:")
     await state.set_state(ReportStates.waiting_target)
 
-@dp.message(ReportStates.waiting_target)
-@report_router.message(ReportStates.waiting_target)
+@dp.message(ReportStates.waiting_target, F.text)
+@report_router.message(ReportStates.waiting_target, F.text)
 async def report_target(message: Message, state: FSMContext):
     target = message.text.strip().lstrip("@")
     if not target:
@@ -1885,8 +1884,8 @@ async def report_target(message: Message, state: FSMContext):
     await message.answer("📝 Введите текст жалобы:")
     await state.set_state(ReportStates.waiting_text)
 
-@dp.message(ReportStates.waiting_text)
-@report_router.message(ReportStates.waiting_text)
+@dp.message(ReportStates.waiting_text, F.text)
+@report_router.message(ReportStates.waiting_text, F.text)
 async def report_text(message: Message, state: FSMContext, bot: Bot):
     report_text = message.text.strip()
     if not report_text:
@@ -2084,7 +2083,7 @@ async def results_screenshot(message: Message, state: FSMContext, bot: Bot):
     await message.answer("📃 Введите счет игры (например: 13 1)")
     await state.set_state(ResultStates.waiting_score)
 
-@dp.message(ResultStates.waiting_score)
+@dp.message(ResultStates.waiting_score, F.text)
 async def results_score(message: Message, state: FSMContext, bot: Bot):
     if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
     data = await state.get_data()
@@ -2251,7 +2250,7 @@ async def my_cancel_request(query: CallbackQuery, state: FSMContext):
     menu_messages[query.from_user.id] = msg
     await state.set_state(CancelMatchStates.waiting_reason)
 
-@dp.message(CancelMatchStates.waiting_reason)
+@dp.message(CancelMatchStates.waiting_reason, F.text)
 async def my_cancel_reason(message: Message, state: FSMContext, bot: Bot):
     reason = message.text.strip()
     if not reason:
@@ -2343,7 +2342,7 @@ async def admin_edit_result_prompt(query: CallbackQuery, state: FSMContext):
     menu_messages[query.from_user.id] = msg
     await state.set_state(AdminStates.waiting_new_score)
 
-@dp.message(AdminStates.waiting_new_score)
+@dp.message(AdminStates.waiting_new_score, F.text)
 async def admin_edit_result_exec(message: Message, state: FSMContext):
     if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
 
@@ -2383,7 +2382,7 @@ async def admin_manage_account(query: CallbackQuery, state: FSMContext):
     menu_messages[query.from_user.id] = msg
     await state.set_state(ManageAccountStates.waiting_user)
 
-@dp.message(ManageAccountStates.waiting_user)
+@dp.message(ManageAccountStates.waiting_user, F.text)
 async def manage_account_user(message: Message, state: FSMContext):
     arg = message.text.strip()
     target_id = None
@@ -2459,6 +2458,9 @@ async def manage_account_value(message: Message, state: FSMContext):
     target_id = data.get("target_id")
     action = data.get("action")
     if action in ("nick", "sid"):
+        if not message.text:
+            await message.answer("Отправьте текст.")
+            return
         value = message.text.strip()
         if action == "nick":
             c.execute("UPDATE users SET nickname=? WHERE user_id=?", (value, target_id))
@@ -2479,6 +2481,8 @@ async def manage_account_value(message: Message, state: FSMContext):
             banner_cache.pop(target_id, None)
         conn.commit()
         await message.answer("Обновлено.")
+    else:
+        await message.answer("Неизвестное действие.")
     await state.clear()
 
 # ------------------------------------------------------------
