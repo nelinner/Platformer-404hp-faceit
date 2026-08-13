@@ -13,6 +13,7 @@ TOPIC_LOBBY_1x1_2 = 2
 TOPIC_DRAW = 22
 TOPIC_RESULTS = 25
 TOPIC_TICKET = 43
+TOPIC_BAN = 5974          # <-- добавлено для уведомлений о банах
 
 MAX_PLAYERS = {"5x5": 10, "2x2": 4, "1x1": 2}
 
