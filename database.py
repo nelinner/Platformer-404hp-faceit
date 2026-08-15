@@ -1,13 +1,16 @@
 import sqlite3
+import os
 from datetime import datetime, timedelta
 from config import OWNER_ID
 
-# Глобальное подключение (один раз при импорте модуля)
-conn = sqlite3.connect("bot_data.db", check_same_thread=False)
+# Путь к БД через переменную окружения (для облачных платформ)
+DB_PATH = os.environ.get("DB_PATH", "/tmp/bot_data.db")
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 c = conn.cursor()
 
 def init_db():
-    """Создаёт таблицы, выполняет миграции и начальные вставки."""
     c.executescript("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
@@ -21,8 +24,10 @@ def init_db():
         banned_until TEXT,
         muted_until TEXT,
         premium INTEGER DEFAULT 0,
+        premium_until TEXT,
         game_ban INTEGER DEFAULT 0,
-        badge TEXT DEFAULT ''
+        badge TEXT DEFAULT '',
+        balance INTEGER DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS lobbies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,14 +96,30 @@ def init_db():
         status TEXT DEFAULT 'open',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS referrals (
+        invited_id INTEGER PRIMARY KEY,
+        inviter_id INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS promocodes (
+        code TEXT PRIMARY KEY,
+        reward_type TEXT NOT NULL,
+        reward_value INTEGER NOT NULL,
+        max_uses INTEGER DEFAULT 1,
+        used_count INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS promo_uses (
+        user_id INTEGER,
+        code TEXT,
+        PRIMARY KEY (user_id, code)
+    );
     """)
     conn.commit()
 
-    # Сбрасываем бан владельцу
+    # Сброс бана владельцу
     c.execute("UPDATE users SET banned_until=NULL WHERE user_id=?", (OWNER_ID,))
     conn.commit()
 
-    # Миграции (добавление отсутствующих столбцов, если потребуется)
+    # Миграции
     migrations = [
         "ALTER TABLE lobbies ADD COLUMN map_name TEXT",
         "ALTER TABLE users ADD COLUMN custom_avatar TEXT",
@@ -110,6 +131,8 @@ def init_db():
         "ALTER TABLE users ADD COLUMN losses INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN game_ban INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN badge TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN premium_until TEXT"
     ]
     for mig in migrations:
         try:
@@ -118,12 +141,11 @@ def init_db():
         except:
             pass
 
-    # Главный администратор
     c.execute("INSERT OR IGNORE INTO admins (username) VALUES ('nelinner')")
     conn.commit()
 
 # ------------------------------------------------------------
-# Вспомогательные функции для работы с БД
+# Вспомогательные функции
 # ------------------------------------------------------------
 
 def is_registered(user_id):
@@ -153,9 +175,17 @@ def is_admin(username):
     return c.fetchone() is not None
 
 def is_premium(user_id):
-    c.execute("SELECT premium FROM users WHERE user_id=?", (user_id,))
+    c.execute("SELECT premium_until FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
-    return row and row[0] == 1
+    if row and row[0]:
+        try:
+            return datetime.fromisoformat(row[0]) > datetime.now()
+        except:
+            pass
+    # Проверяем старый флаг premium
+    c.execute("SELECT premium FROM users WHERE user_id=?", (user_id,))
+    row2 = c.fetchone()
+    return row2 and row2[0] == 1
 
 def get_elo(user_id):
     c.execute("SELECT elo FROM users WHERE user_id=?", (user_id,))
@@ -191,9 +221,6 @@ def increment_map_count(user_id, map_name):
     conn.commit()
 
 def find_user(identifier: str):
-    """Возвращает user_id по @username или никнейму, либо None.
-       Временная защита: никогда не возвращает OWNER_ID,
-       если только не ищется сам 'nelinner'."""
     if identifier.startswith("@"):
         username = identifier.lstrip("@").lower()
         if username != "nelinner":
@@ -207,7 +234,6 @@ def find_user(identifier: str):
             row = c.fetchone()
             return row[0] if row else None
     else:
-        # Поиск по никнейму
         c.execute("SELECT user_id FROM users WHERE nickname=? AND user_id != ?", (identifier, OWNER_ID))
         row = c.fetchone()
         if row:
@@ -248,7 +274,6 @@ def update_report_target_id(report_id, target_id):
     conn.commit()
 
 def get_admin_ids():
-    """Возвращает список user_id всех администраторов."""
     c.execute("SELECT username FROM admins")
     admins = [row[0] for row in c.fetchall()]
     admin_ids = []
@@ -259,11 +284,9 @@ def get_admin_ids():
             admin_ids.append(row[0])
     return admin_ids
 
-# ----------------- Новые функции для управления лобби и матчами -----------------
+# ----------------- Управление лобби и матчами -----------------
 
 def get_lobbies_with_players():
-    """Возвращает список лобби (id, mode, thread_id, количество игроков),
-       в которых есть хотя бы один зарегистрированный игрок."""
     c.execute("""
         SELECT l.id, l.mode, l.thread_id, COUNT(lr.user_id)
         FROM lobbies l
@@ -274,7 +297,6 @@ def get_lobbies_with_players():
     return c.fetchall()
 
 def get_players_in_lobby(lobby_id):
-    """Возвращает список (user_id, nickname) игроков в указанном лобби."""
     c.execute("""
         SELECT u.user_id, u.nickname
         FROM lobby_registrations lr
@@ -284,14 +306,11 @@ def get_players_in_lobby(lobby_id):
     return c.fetchall()
 
 def remove_player_from_lobby(lobby_id, user_id):
-    """Удаляет игрока из лобби."""
     c.execute("DELETE FROM lobby_registrations WHERE lobby_id = ? AND user_id = ?",
               (lobby_id, user_id))
     conn.commit()
 
 def add_player_to_lobby(lobby_id, user_id):
-    """Добавляет игрока в лобби, если он не забанен, не имеет игрового бана и ещё не в лобби.
-       Возвращает True при успехе, иначе False."""
     if is_banned(user_id) or is_game_banned(user_id):
         return False
     c.execute("SELECT 1 FROM lobby_registrations WHERE lobby_id=? AND user_id=?", (lobby_id, user_id))
@@ -303,8 +322,6 @@ def add_player_to_lobby(lobby_id, user_id):
     return True
 
 def get_user_active_matches(user_id):
-    """Возвращает список активных матчей (id, lobby_id, match_number, map_name, mode, created_at),
-       где пользователь является хостом и статус = 'drawn'."""
     c.execute("""
         SELECT m.id, m.lobby_id, m.match_number, l.map_name, l.mode, m.created_at
         FROM matches m
@@ -315,13 +332,10 @@ def get_user_active_matches(user_id):
     return c.fetchall()
 
 def cancel_match(match_id):
-    """Отменяет матч (ставит статус 'cancelled')."""
     c.execute("UPDATE matches SET status = 'cancelled' WHERE id = ?", (match_id,))
     conn.commit()
 
 def get_match_info(match_id):
-    """Возвращает (match_id, lobby_id, match_number, map_name, mode, host_id, status)
-       для указанного матча."""
     c.execute("""
         SELECT m.id, m.lobby_id, m.match_number, l.map_name, l.mode, m.host_id, m.status
         FROM matches m
@@ -330,7 +344,7 @@ def get_match_info(match_id):
     """, (match_id,))
     return c.fetchone()
 
-# ----------------- Функции для бейджей -----------------
+# ----------------- Бейджи -----------------
 
 def get_user_badge(user_id):
     c.execute("SELECT badge FROM users WHERE user_id=?", (user_id,))
@@ -341,37 +355,30 @@ def set_user_badge(user_id, badge):
     c.execute("UPDATE users SET badge=? WHERE user_id=?", (badge, user_id))
     conn.commit()
 
-# ----------------- Функции для DUO -----------------
+# ----------------- DUO -----------------
 
 def get_duo_partner(user_id):
-    """Возвращает user_id партнёра по дуо, либо None."""
     c.execute("SELECT friend_nickname FROM duos WHERE user_id=?", (user_id,))
     row = c.fetchone()
     if not row:
         return None
     friend_nick = row[0]
-    # Ищем партнёра по никнейму
     c.execute("SELECT user_id FROM users WHERE nickname=?", (friend_nick,))
     row2 = c.fetchone()
     return row2[0] if row2 else None
 
 def remove_duo(user_id):
-    """Удаляет дуо-связку для обоих участников."""
-    # Получаем партнёра
     c.execute("SELECT friend_nickname FROM duos WHERE user_id=?", (user_id,))
     row = c.fetchone()
     if row:
         partner_nick = row[0]
-        # Удаляем запись у инициатора
         c.execute("DELETE FROM duos WHERE user_id=?", (user_id,))
-        # Удаляем запись у партнёра (если он есть в БД)
         c.execute("DELETE FROM duos WHERE user_id IN (SELECT user_id FROM users WHERE nickname=?)", (partner_nick,))
         conn.commit()
 
-# ----------------- Функции для управления результатами -----------------
+# ----------------- Результаты матчей -----------------
 
 def get_all_finished_matches():
-    """Возвращает список всех завершённых матчей (status='finished')."""
     c.execute("""
         SELECT m.id, m.lobby_id, m.match_number, l.map_name, l.mode, m.host_id, m.score
         FROM matches m
@@ -382,8 +389,6 @@ def get_all_finished_matches():
     return c.fetchall()
 
 def update_match_score(match_id, new_ct_score, new_t_score):
-    """Обновляет счёт матча и пересчитывает ELO."""
-    # Получаем старый счёт
     c.execute("SELECT score FROM matches WHERE id=?", (match_id,))
     row = c.fetchone()
     if not row or not row[0]:
@@ -392,24 +397,19 @@ def update_match_score(match_id, new_ct_score, new_t_score):
     old_ct = int(old_score[0])
     old_t = int(old_score[1])
 
-    # Обновляем счёт
     c.execute("UPDATE matches SET score=? WHERE id=?", (f"{new_ct_score}-{new_t_score}", match_id))
 
-    # Получаем игроков матча
     c.execute("SELECT user_id, team FROM match_players WHERE match_id=?", (match_id,))
     players = c.fetchall()
 
-    # Сначала откатываем старые изменения ELO
     for uid, team in players:
         is_winner_old = (team == 'CT' and old_ct > old_t) or (team == 'T' and old_t > old_ct)
         premium = is_premium(uid)
         delta_old = (50 if premium else 25) if is_winner_old else (-15 if premium else -10)
         current_elo = get_elo(uid)
-        # Откатываем: вычитаем то, что добавили
         c.execute("UPDATE users SET elo = ?, wins = CASE WHEN ? THEN wins - 1 ELSE wins END, losses = CASE WHEN ? THEN losses ELSE losses - 1 END WHERE user_id=?",
                   (max(0, current_elo - delta_old), is_winner_old, is_winner_old, uid))
 
-    # Начисляем ELO заново
     for uid, team in players:
         is_winner_new = (team == 'CT' and new_ct_score > new_t_score) or (team == 'T' and new_t_score > new_ct_score)
         premium = is_premium(uid)
@@ -422,3 +422,74 @@ def update_match_score(match_id, new_ct_score, new_t_score):
 
     conn.commit()
     return True
+
+# ----------------- Реферальная система -----------------
+
+def create_referral(invited_id, inviter_id):
+    try:
+        c.execute("INSERT OR IGNORE INTO referrals (invited_id, inviter_id) VALUES (?, ?)", (invited_id, inviter_id))
+        conn.commit()
+        return c.rowcount > 0
+    except:
+        return False
+
+def get_referral_count(user_id):
+    c.execute("SELECT COUNT(*) FROM referrals WHERE inviter_id=?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else 0
+
+def get_balance(user_id):
+    c.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else 0
+
+def add_balance(user_id, amount):
+    c.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
+    conn.commit()
+
+def add_premium_days(user_id, days):
+    c.execute("SELECT premium_until FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    if row and row[0]:
+        current = datetime.fromisoformat(row[0])
+        if current < datetime.now():
+            current = datetime.now()
+        new_until = current + timedelta(days=days)
+    else:
+        new_until = datetime.now() + timedelta(days=days)
+    c.execute("UPDATE users SET premium=1, premium_until=? WHERE user_id=?", (new_until.isoformat(), user_id))
+    conn.commit()
+
+# ----------------- Промокоды -----------------
+
+def create_promo(code, reward_type, reward_value, max_uses=1):
+    c.execute("INSERT OR REPLACE INTO promocodes (code, reward_type, reward_value, max_uses) VALUES (?, ?, ?, ?)",
+              (code.upper(), reward_type, reward_value, max_uses))
+    conn.commit()
+
+def use_promo(user_id, code):
+    code = code.upper()
+    c.execute("SELECT * FROM promocodes WHERE code=?", (code,))
+    promo = c.fetchone()
+    if not promo:
+        return False, "Промокод не найден."
+    _, reward_type, reward_value, max_uses, used_count = promo
+    if used_count >= max_uses:
+        return False, "Промокод исчерпан."
+    c.execute("SELECT 1 FROM promo_uses WHERE user_id=? AND code=?", (user_id, code))
+    if c.fetchone():
+        return False, "Вы уже использовали этот промокод."
+    c.execute("UPDATE promocodes SET used_count = used_count + 1 WHERE code=?", (code,))
+    c.execute("INSERT OR IGNORE INTO promo_uses (user_id, code) VALUES (?, ?)", (user_id, code))
+    if reward_type == 'premium':
+        add_premium_days(user_id, reward_value)
+        message = f"Вам начислено {reward_value} дней премиума."
+    elif reward_type == 'balance':
+        add_balance(user_id, reward_value)
+        message = f"На ваш баланс начислено {reward_value} единиц."
+    else:
+        c.execute("UPDATE promocodes SET used_count = used_count - 1 WHERE code=?", (code,))
+        conn.commit()
+        return False, "Неизвестный тип награды."
+    conn.commit()
+    return True, message
