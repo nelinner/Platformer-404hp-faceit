@@ -638,6 +638,7 @@ async def generate_draft_image(bot, lobby_id, mode, ct_ids, t_ids, map_name, mat
 
 async def update_lobby_post(bot: Bot, lobby_id: int):
     img_data = await generate_lobby_image(bot, lobby_id)
+    img_bytes = img_data.read() if img_data else None
 
     c.execute("SELECT mode, thread_id, match_number FROM lobbies WHERE id=?", (lobby_id,))
     mode, thread_id, match_num = c.fetchone()
@@ -659,8 +660,8 @@ async def update_lobby_post(bot: Bot, lobby_id: int):
 
     if msg_id:
         try:
-            if img_data:
-                photo = BufferedInputFile(img_data.read(), filename="lobby.png")
+            if img_bytes:
+                photo = BufferedInputFile(img_bytes, filename="lobby.png")
                 await bot.edit_message_media(
                     chat_id=GROUP_CHAT_ID,
                     message_id=msg_id,
@@ -682,8 +683,8 @@ async def update_lobby_post(bot: Bot, lobby_id: int):
             except Exception as del_e:
                 logging.warning(f"Не удалось удалить сообщение {msg_id}: {del_e}")
 
-    if img_data:
-        photo = BufferedInputFile(img_data.read(), filename="lobby.png")
+    if img_bytes:
+        photo = BufferedInputFile(img_bytes, filename="lobby.png")
         msg = await bot.send_photo(GROUP_CHAT_ID, photo, caption=text, reply_markup=keyboard, message_thread_id=thread_id)
     else:
         msg = await bot.send_message(GROUP_CHAT_ID, text, reply_markup=keyboard, message_thread_id=thread_id)
