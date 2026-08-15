@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import os
+import sys
 import requests
 import uuid
 from datetime import datetime, timedelta
@@ -220,6 +221,7 @@ def generate_profile_card(user_id: int, username: Optional[str] = None,
     nickname, standoff_id = row
     premium = is_premium(user_id)
     badge = get_user_badge(user_id)
+    frame = get_user_frame(user_id)
 
     w, h = 800, 480
     img = Image.new("RGBA", (w, h), (0,0,0,0))
@@ -250,8 +252,22 @@ def generate_profile_card(user_id: int, username: Optional[str] = None,
         ImageDraw.Draw(mask).ellipse((0,0,avatar_size,avatar_size), fill=255)
         avatar_img = cached_avatar.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
         img.paste(avatar_img, (avatar_x, avatar_cy - avatar_size//2), mask)
-        draw.ellipse([avatar_x-5, avatar_cy-avatar_size//2-5, avatar_x+avatar_size+5, avatar_cy+avatar_size//2+5],
-                     outline=FACEIT_ORANGE, width=4)
+
+    frame_color = FACEIT_ORANGE
+    frame_width = 4
+    if frame == "Gold frame":
+        frame_color = (255, 215, 0)
+        frame_width = 6
+    elif frame == "Snow frame":
+        frame_color = (173, 216, 230)
+        frame_width = 6
+    elif frame == "Infernal frame":
+        frame_color = (255, 69, 0)
+        frame_width = 6
+
+    draw.ellipse([avatar_x-5, avatar_cy-avatar_size//2-5,
+                  avatar_x+avatar_size+5, avatar_cy+avatar_size//2+5],
+                 outline=frame_color, width=frame_width)
 
     try:
         font_nick = ImageFont.truetype(FONT_PATH, 34)
@@ -369,10 +385,12 @@ def draw_player_slot(draw, x, y, w, h, user_id, elo, sid, avatar=None, banner=No
             ImageDraw.Draw(mask).ellipse((0,0,avatar_r*2,avatar_r*2), fill=255)
             avatar_resized = avatar.resize((avatar_r*2, avatar_r*2), Image.Resampling.LANCZOS)
             draw._image.paste(avatar_resized, (avatar_cx-avatar_r, avatar_cy-avatar_r), mask)
-            draw.ellipse([avatar_cx-avatar_r-2, avatar_cy-avatar_r-2, avatar_cx+avatar_r+2, avatar_cy+avatar_r+2],
+            draw.ellipse([avatar_cx-avatar_r-2, avatar_cy-avatar_r-2,
+                          avatar_cx+avatar_r+2, avatar_cy+avatar_r+2],
                          outline=FACEIT_ORANGE, width=3)
         else:
-            draw.ellipse([avatar_cx-avatar_r, avatar_cy-avatar_r, avatar_cx+avatar_r, avatar_cy+avatar_r],
+            draw.ellipse([avatar_cx-avatar_r, avatar_cy-avatar_r,
+                          avatar_cx+avatar_r, avatar_cy+avatar_r],
                          fill=(35,38,55), outline=FACEIT_ORANGE, width=3)
 
         if show_username:
@@ -511,7 +529,7 @@ async def generate_lobby_image(bot: Bot, lobby_id: int) -> Optional[BytesIO]:
                 is_adm = uname and is_admin(uname[0])
                 premium = is_premium(pid)
                 draw_player_slot(draw, x, y, slot_w, slot_h, pid, elo, sid, av, bn, is_own, is_adm, premium,
-                                 show_username=False)   # Без username
+                                 show_username=False)
             else:
                 draw.rounded_rectangle([x, y, x+slot_w, y+slot_h], radius=18, fill=(255,255,255,12), outline=(255,255,255,40))
                 font_wait = get_font(32)
@@ -827,7 +845,7 @@ async def auto_reset_lobbies():
             logging.error(f"Ошибка в автосбросе лобби: {e}")
 
 # ------------------------------------------------------------
-# FSM
+# FSM, CallbackData
 # ------------------------------------------------------------
 class RegStates(StatesGroup):
     nick = State()
@@ -839,6 +857,8 @@ class AdminStates(StatesGroup):
     waiting_remove = State()
     waiting_replace_new_user = State()
     waiting_new_score = State()
+    waiting_coins_user = State()
+    waiting_coins_amount = State()
 
 class BanPlayerStates(StatesGroup):
     waiting_nick = State()
@@ -881,13 +901,13 @@ class PromoStates(StatesGroup):
     waiting_code = State()
 
 class PromoCreationStates(StatesGroup):
+    waiting_code_text = State()
     waiting_activations = State()
     waiting_custom_activations = State()
     waiting_reward_type = State()
     waiting_reward_amount = State()
     waiting_custom_amount = State()
 
-# CallbackData
 class ReportAction(CallbackData, prefix="report"):
     action: str
     report_id: int
@@ -905,9 +925,11 @@ async def main_menu_keyboard(user_id, username):
         [InlineKeyboardButton(text="👤 Профиль", callback_data="menu_profile")],
         [InlineKeyboardButton(text="👥 My duo", callback_data="my_duo")],
         [InlineKeyboardButton(text="🤝 Пригласить", callback_data="menu_invite")],
+        [InlineKeyboardButton(text="🎟 Промокод", callback_data="menu_promo")],
         [InlineKeyboardButton(text="🔎 Поиск лобби", callback_data="menu_search")],
         [InlineKeyboardButton(text="🎮 Мои лобби", callback_data="my_lobbies")],
         [InlineKeyboardButton(text="🏆 Лидерборд", callback_data="menu_leaderboard")],
+        [InlineKeyboardButton(text="💰 Магазин", callback_data="menu_shop")],
         [InlineKeyboardButton(text="🎫 Тикет поддержки", callback_data="menu_ticket")],
     ]
     if is_admin(username):
@@ -966,7 +988,7 @@ async def reg_confirm(query: CallbackQuery, state: FSMContext):
         if inviter_id and inviter_id != user.id:
             if create_referral(user.id, inviter_id):
                 add_premium_days(inviter_id, 1)
-                add_balance(inviter_id, 5)
+                add_coins(inviter_id, 5)
 
         await query.message.edit_text("Регистрация успешна! ✅")
         msg = await bot.send_message(chat_id=user.id,
@@ -990,11 +1012,13 @@ async def profile(query: CallbackQuery, bot: Bot):
     elo, wins, losses = get_user_stats(user_id)
     total = wins + losses
     winrate = (wins / total * 100) if total > 0 else 0
+    coins = get_coins(user_id)
     info_text = (
         f"ℹ️ Информация об игроке:\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"[👤] Nickname: {nick}\n"
         f"[🪪] ID: {sid}\n"
+        f"[💲] Coins: {coins}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"[⚡] Сыграно матчей: {total}\n"
         f"[🏆] Victory: {wins} ({winrate:.1f}%)\n"
@@ -1274,7 +1298,6 @@ async def lobby_join(query: CallbackQuery, bot: Bot):
 async def lobby_leave(query: CallbackQuery, bot: Bot):
     user_id = query.from_user.id; lobby_id = int(query.data.split("_")[-1])
     if is_banned(user_id): await query.answer("Вы забанены в боте.", show_alert=True); return
-    # Проверяем, есть ли игрок в лобби
     c.execute("SELECT 1 FROM lobby_registrations WHERE lobby_id=? AND user_id=?", (lobby_id, user_id))
     if not c.fetchone():
         await query.answer("Вы не в этом лобби.", show_alert=True)
@@ -1284,7 +1307,7 @@ async def lobby_leave(query: CallbackQuery, bot: Bot):
     await update_lobby_post(bot, lobby_id)
 
 # ------------------------------------------------------------
-# Админ панель (создание промокодов и пр.)
+# Админ панель
 # ------------------------------------------------------------
 @dp.callback_query(F.data == "menu_admin")
 async def admin_menu(query: CallbackQuery):
@@ -1303,6 +1326,7 @@ async def admin_menu(query: CallbackQuery):
         [InlineKeyboardButton(text="🏞️ Управление картой", callback_data="admin_manage_map")],
         [InlineKeyboardButton(text="🔴 Бан игрока", callback_data="admin_ban_player")],
         [InlineKeyboardButton(text="⚙️ Создать промокод", callback_data="admin_create_promo")],
+        [InlineKeyboardButton(text="💰 Выдать coins", callback_data="admin_give_coins")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")],
     ])
     if query.from_user.id == OWNER_ID:
@@ -1484,14 +1508,70 @@ async def admin_ban_player_reason(message: Message, state: FSMContext, bot: Bot)
     await message.answer(f"Пользователь {target_nick} забанен на {duration} минут.")
     await state.clear()
 
+# ========== Выдать Coins ==========
+@dp.callback_query(F.data == "admin_give_coins")
+async def admin_give_coins_start(query: CallbackQuery, state: FSMContext):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    if not is_admin(query.from_user.username):
+        await query.answer("Нет доступа.")
+        return
+    await state.set_state(AdminStates.waiting_coins_user)
+    msg = await query.message.edit_text("📃 Введите @username игрока:")
+    menu_messages[query.from_user.id] = msg
+
+@dp.message(AdminStates.waiting_coins_user, F.text)
+async def admin_give_coins_user(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.username):
+        await message.answer("Нет доступа."); await state.clear(); return
+    identifier = message.text.strip()
+    target_id = find_user(identifier)
+    if not target_id:
+        await message.answer("Пользователь не найден.")
+        await state.clear()
+        return
+    await state.update_data(target_id=target_id)
+    await message.answer("📃 Введите количество coins для выдачи:")
+    await state.set_state(AdminStates.waiting_coins_amount)
+
+@dp.message(AdminStates.waiting_coins_amount, F.text)
+async def admin_give_coins_amount(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.username):
+        await message.answer("Нет доступа."); await state.clear(); return
+    try:
+        amount = int(message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except:
+        await message.answer("Введите положительное число.")
+        return
+    data = await state.get_data()
+    target_id = data["target_id"]
+    add_coins(target_id, amount)
+    await message.answer(f"✅ Выдано {amount} Coins пользователю {get_nickname(target_id)}.")
+    await state.clear()
+
 # ========== Создание промокода ==========
 @dp.callback_query(F.data == "admin_create_promo")
 async def admin_create_promo_start(query: CallbackQuery, state: FSMContext):
     if not is_owner_of_menu(query):
         await query.answer("Это меню другого пользователя.", show_alert=True)
         return
-    if not is_admin(query.from_user.username): await query.answer("Нет доступа."); return
-    await state.set_state(PromoCreationStates.waiting_activations)
+    if not is_admin(query.from_user.username):
+        await query.answer("Нет доступа.")
+        return
+    await state.set_state(PromoCreationStates.waiting_code_text)
+    msg = await query.message.edit_text("📃 Введите текст промокода:")
+    menu_messages[query.from_user.id] = msg
+
+@dp.message(PromoCreationStates.waiting_code_text, F.text)
+async def promo_code_text(message: Message, state: FSMContext):
+    code_text = message.text.strip().upper()
+    if not code_text:
+        await message.answer("Промокод не может быть пустым.")
+        return
+    await state.update_data(code_text=code_text)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="1", callback_data="promo_act_1")],
         [InlineKeyboardButton(text="10", callback_data="promo_act_10")],
@@ -1501,8 +1581,8 @@ async def admin_create_promo_start(query: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="Своё", callback_data="promo_act_custom")],
         [InlineKeyboardButton(text="Отмена", callback_data="promo_cancel")],
     ])
-    msg = await query.message.edit_text("Выберите количество активаций промокода:", reply_markup=keyboard)
-    menu_messages[query.from_user.id] = msg
+    await message.answer("Выберите количество активаций промокода:", reply_markup=keyboard)
+    await state.set_state(PromoCreationStates.waiting_activations)
 
 @dp.callback_query(PromoCreationStates.waiting_activations, F.data.startswith("promo_act_"))
 async def promo_activations_choice(query: CallbackQuery, state: FSMContext):
@@ -1519,7 +1599,8 @@ async def promo_activations_choice(query: CallbackQuery, state: FSMContext):
     await state.update_data(activations=activations)
     await query.message.edit_text("Выберите тип награды:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Премиум", callback_data="promo_type_premium")],
-        [InlineKeyboardButton(text="Голда (баланс)", callback_data="promo_type_balance")],
+        [InlineKeyboardButton(text="Coins", callback_data="promo_type_coins")],
+        [InlineKeyboardButton(text="Баланс (старый)", callback_data="promo_type_balance")],
         [InlineKeyboardButton(text="Отмена", callback_data="promo_cancel")],
     ]))
     await state.set_state(PromoCreationStates.waiting_reward_type)
@@ -1538,7 +1619,8 @@ async def promo_custom_activations(message: Message, state: FSMContext):
     await state.update_data(activations=activations)
     await message.answer("Выберите тип награды:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Премиум", callback_data="promo_type_premium")],
-        [InlineKeyboardButton(text="Голда (баланс)", callback_data="promo_type_balance")],
+        [InlineKeyboardButton(text="Coins", callback_data="promo_type_coins")],
+        [InlineKeyboardButton(text="Баланс (старый)", callback_data="promo_type_balance")],
         [InlineKeyboardButton(text="Отмена", callback_data="promo_cancel")],
     ]))
     await state.set_state(PromoCreationStates.waiting_reward_type)
@@ -1550,7 +1632,7 @@ async def promo_reward_type_choice(query: CallbackQuery, state: FSMContext):
         await state.clear()
         await query.message.edit_text("Создание промокода отменено.")
         return
-    reward_type = data.split("_")[-1]  # premium или balance
+    reward_type = data.split("_")[-1]  # premium, coins, balance
     await state.update_data(reward_type=reward_type)
     if reward_type == "premium":
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -1608,13 +1690,13 @@ async def finalize_promo_creation(source: Message | CallbackQuery, state: FSMCon
     activations = data.get("activations")
     reward_type = data.get("reward_type")
     amount = data.get("amount")
-    code = str(uuid.uuid4())[:8].upper()
-    create_promo(code, reward_type, amount, activations)
+    code_text = data.get("code_text")
+    create_promo(code_text, reward_type, amount, activations)
     text = (
         f"✅ Промокод создан!\n"
-        f"Код: {code}\n"
+        f"Код: {code_text}\n"
         f"Активаций: {activations}\n"
-        f"Тип награды: { 'Премиум (дней)' if reward_type == 'premium' else 'Голда (баланс)' }\n"
+        f"Тип награды: { 'Премиум (дней)' if reward_type == 'premium' else 'Coins' if reward_type == 'coins' else 'Баланс (старый)' }\n"
         f"Количество: {amount}"
     )
     if isinstance(source, CallbackQuery):
@@ -1625,8 +1707,201 @@ async def finalize_promo_creation(source: Message | CallbackQuery, state: FSMCon
     await state.clear()
 
 # ------------------------------------------------------------
-# Остальные обработчики (пользователи, тикеты, результаты и т.д.)
+# Магазин
 # ------------------------------------------------------------
+@dp.callback_query(F.data == "menu_shop")
+async def menu_shop(query: CallbackQuery):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    if is_banned(query.from_user.id):
+        await query.answer("Вы забанены в боте.", show_alert=True)
+        return
+    user_id = query.from_user.id
+    coins = get_coins(user_id)
+    text = (
+        "💰 shop 404faceit \n"
+        "——————\n"
+        "Привет, ты находишься в магазине 404hp FACEIT где ты можешь приобрести товары от нашего проекта\n"
+        "1) Рамки\n"
+        "2) Премиум\n"
+        "3) Разбан\n\n"
+        "♥️ Выбирай нужный ассортимент\n"
+        "——————\n"
+        f"[💲] Твой баланс: {coins} Coins"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Рамки", callback_data="shop_frames")],
+        [InlineKeyboardButton(text="Премиум", callback_data="shop_premium")],
+        [InlineKeyboardButton(text="Разбан", callback_data="shop_unban")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")],
+    ])
+    msg = await query.message.edit_text(text, reply_markup=keyboard)
+    menu_messages[user_id] = msg
+
+@dp.callback_query(F.data == "shop_frames")
+async def shop_frames(query: CallbackQuery):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    text = (
+        "Доступные рамки для покупки:\n"
+        f"Gold frame: {GOLD_FRAME_PRICE} Coins\n"
+        f"Snow frame: {SNOW_FRAME_PRICE} Coins\n"
+        f"Infernal frame: {INFERNAL_FRAME_PRICE} Coins\n\n"
+        "Нажмите на рамку, чтобы посмотреть."
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Gold frame", callback_data="view_frame_gold")],
+        [InlineKeyboardButton(text="Snow frame", callback_data="view_frame_snow")],
+        [InlineKeyboardButton(text="Infernal frame", callback_data="view_frame_infernal")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_shop")],
+    ])
+    msg = await query.message.edit_text(text, reply_markup=keyboard)
+    menu_messages[query.from_user.id] = msg
+
+@dp.callback_query(F.data.startswith("view_frame_"))
+async def view_frame(query: CallbackQuery):
+    frame_key = query.data.split("_")[-1]  # gold/snow/infernal
+    frames = {
+        "gold": (GOLD_FRAME_IMAGE_URL, "Gold frame", GOLD_FRAME_PRICE),
+        "snow": (SNOW_FRAME_IMAGE_URL, "Snow frame", SNOW_FRAME_PRICE),
+        "infernal": (INFERNAL_FRAME_IMAGE_URL, "Infernal frame", INFERNAL_FRAME_PRICE),
+    }
+    if frame_key not in frames:
+        await query.answer("Неизвестная рамка")
+        return
+    image_url, frame_name, price = frames[frame_key]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Купить за {price} Coins", callback_data=f"buy_frame_{frame_key}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="shop_frames")],
+    ])
+    try:
+        await bot.send_photo(query.from_user.id, image_url, caption=frame_name, reply_markup=keyboard)
+    except Exception as e:
+        await query.answer("Не удалось загрузить изображение рамки.")
+        return
+    await query.message.delete()
+
+@dp.callback_query(F.data.startswith("buy_frame_"))
+async def buy_frame(query: CallbackQuery):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    user_id = query.from_user.id
+    frame_key = query.data.split("_")[-1]
+    frames = {
+        "gold": ("Gold frame", GOLD_FRAME_PRICE),
+        "snow": ("Snow frame", SNOW_FRAME_PRICE),
+        "infernal": ("Infernal frame", INFERNAL_FRAME_PRICE)
+    }
+    if frame_key not in frames:
+        await query.answer("Неизвестная рамка.")
+        return
+    frame_name, price = frames[frame_key]
+    coins = get_coins(user_id)
+    if coins < price:
+        await query.answer(f"Недостаточно Coins. Нужно {price}, у вас {coins}.", show_alert=True)
+        return
+    add_coins(user_id, -price)
+    set_user_frame(user_id, frame_name)
+    await query.answer(f"Вы купили рамку {frame_name} за {price} Coins!")
+    # Удаляем фото с кнопкой покупки
+    try:
+        await bot.delete_message(chat_id=query.message.chat.id, message_id=query.message.message_id)
+    except:
+        pass
+    await menu_shop(query)
+
+@dp.callback_query(F.data == "shop_premium")
+async def shop_premium(query: CallbackQuery):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    user_id = query.from_user.id
+    coins = get_coins(user_id)
+    if coins < PREMIUM_30_DAYS_PRICE:
+        await query.answer(f"Недостаточно Coins. Нужно {PREMIUM_30_DAYS_PRICE}, у вас {coins}.", show_alert=True)
+        return
+    add_coins(user_id, -PREMIUM_30_DAYS_PRICE)
+    add_premium_days(user_id, 30)
+    await query.answer("Вы купили Премиум на 30 дней!")
+    await menu_shop(query)
+
+@dp.callback_query(F.data == "shop_unban")
+async def shop_unban(query: CallbackQuery):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    user_id = query.from_user.id
+    if not is_game_banned(user_id):
+        await query.answer("У вас нет игрового бана.")
+        return
+    coins = get_coins(user_id)
+    if coins < UNBAN_PRICE:
+        await query.answer(f"Недостаточно Coins. Нужно {UNBAN_PRICE}, у вас {coins}.", show_alert=True)
+        return
+    add_coins(user_id, -UNBAN_PRICE)
+    c.execute("UPDATE users SET game_ban=0 WHERE user_id=?", (user_id,))
+    conn.commit()
+    await query.answer("Вы успешно сняли игровой бан!")
+    await menu_shop(query)
+
+# ------------------------------------------------------------
+# Пригласить и промокод (пользовательские)
+# ------------------------------------------------------------
+@dp.callback_query(F.data == "menu_invite")
+async def menu_invite(query: CallbackQuery):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    if is_banned(query.from_user.id):
+        await query.answer("Вы забанены в боте.", show_alert=True)
+        return
+    user_id = query.from_user.id
+    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+    text = (
+        "👥 Реферальная система\n"
+        "——————\n"
+        f"[🔗] Ваша реферальная ссылка: {ref_link}\n"
+        "——————\n"
+        "Вы получаете: За каждого приглашённого друга вы будете получать день премиум статуса, и также 5 Coins на свой баланс"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")],
+    ])
+    msg = await query.message.edit_text(text, reply_markup=keyboard)
+    menu_messages[user_id] = msg
+
+@dp.callback_query(F.data == "menu_promo")
+async def menu_promo(query: CallbackQuery, state: FSMContext):
+    if not is_owner_of_menu(query):
+        await query.answer("Это меню другого пользователя.", show_alert=True)
+        return
+    if is_banned(query.from_user.id):
+        await query.answer("Вы забанены в боте.", show_alert=True)
+        return
+    msg = await query.message.edit_text("Введите промокод:")
+    menu_messages[query.from_user.id] = msg
+    await state.set_state(PromoStates.waiting_code)
+
+@dp.message(PromoStates.waiting_code, F.text)
+async def process_promo(message: Message, state: FSMContext):
+    if is_banned(message.from_user.id):
+        await message.answer("Вы забанены в боте.")
+        await state.clear()
+        return
+    code = message.text.strip()
+    success, msg = use_promo(message.from_user.id, code)
+    await message.answer(msg)
+    await state.clear()
+    user_id = message.from_user.id
+    menu_msg = await message.answer("Главное меню:", reply_markup=await main_menu_keyboard(user_id, message.from_user.username))
+    menu_messages[user_id] = menu_msg
+
+# ------------------------------------------------------------
+# Остальные обработчики (пользователи, тикеты, результаты и т.д.)
+# Все они включены ниже полностью.
 
 @dp.callback_query(F.data == "admin_list")
 async def admin_list(query: CallbackQuery):
@@ -2298,6 +2573,7 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
         new_elo = max(0, get_elo(uid) + delta)
         if is_winner:
             c.execute("UPDATE users SET wins = wins + 1, elo = ? WHERE user_id=?", (new_elo, uid))
+            add_coins(uid, 10)  # +10 Coins за победу
         else:
             c.execute("UPDATE users SET losses = losses + 1, elo = ? WHERE user_id=?", (new_elo, uid))
         increment_map_count(uid, map_name)
@@ -2673,19 +2949,35 @@ async def restore_all_lobby_posts():
             logging.error(f"Не удалось восстановить пост лобби {lobby_id}: {e}")
         await asyncio.sleep(0.5)
 
+# ------------------------------------------------------------
+# Блокировка от повторного запуска
+# ------------------------------------------------------------
+LOCK_FILE = "bot.lock"
+
 async def main():
     global bot
-    init_db()
-    download_font()
-    download_default_banner()
-    load_map_images()
-    init_lobbies()
+    if os.path.exists(LOCK_FILE):
+        print("Бот уже запущен. Завершение.")
+        sys.exit(0)
+    else:
+        with open(LOCK_FILE, "w") as f:
+            f.write(str(os.getpid()))
 
-    bot = Bot(token=TOKEN)
-    dp.include_router(report_router)
-    await restore_all_lobby_posts()
-    asyncio.create_task(auto_reset_lobbies())
-    await dp.start_polling(bot)
+    try:
+        init_db()
+        download_font()
+        download_default_banner()
+        load_map_images()
+        init_lobbies()
+
+        bot = Bot(token=TOKEN)
+        dp.include_router(report_router)
+        await restore_all_lobby_posts()
+        asyncio.create_task(auto_reset_lobbies())
+        await dp.start_polling(bot)
+    finally:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
