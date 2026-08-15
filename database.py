@@ -5,12 +5,9 @@ from config import OWNER_ID
 
 # Уникальное имя файла базы данных, чтобы не пересекаться с другими ботами
 DB_FILENAME = "hp404faceit_bot.db"
-# База будет лежать в подпапке data/ рядом с database.py
+# База будет лежать рядом с database.py
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-DB_PATH = os.environ.get("DB_PATH", os.path.join(DATA_DIR, DB_FILENAME))
+DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, DB_FILENAME))
 
 print(f"Используется база данных: {DB_PATH}")
 
