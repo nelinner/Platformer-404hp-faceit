@@ -1273,11 +1273,17 @@ async def lobby_join(query: CallbackQuery, bot: Bot):
 async def lobby_leave(query: CallbackQuery, bot: Bot):
     user_id = query.from_user.id; lobby_id = int(query.data.split("_")[-1])
     if is_banned(user_id): await query.answer("Вы забанены в боте.", show_alert=True); return
+    # Проверяем, есть ли игрок в лобби
+    c.execute("SELECT 1 FROM lobby_registrations WHERE lobby_id=? AND user_id=?", (lobby_id, user_id))
+    if not c.fetchone():
+        await query.answer("Вы не в этом лобби.", show_alert=True)
+        return
     c.execute("DELETE FROM lobby_registrations WHERE lobby_id=? AND user_id=?", (lobby_id, user_id)); conn.commit()
-    await query.answer("Вы вышли."); await update_lobby_post(bot, lobby_id)
+    await query.answer("Вы вышли.")
+    await update_lobby_post(bot, lobby_id)
 
 # ------------------------------------------------------------
-# Админ панель
+# Админ панель (создание промокодов и пр.)
 # ------------------------------------------------------------
 @dp.callback_query(F.data == "menu_admin")
 async def admin_menu(query: CallbackQuery):
@@ -2334,7 +2340,7 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
 
 # ------------------------------------------------------------
-# Мои лобби
+# Мои лобби (для обычных пользователей)
 # ------------------------------------------------------------
 @dp.callback_query(F.data == "my_lobbies")
 async def my_lobbies(query: CallbackQuery):
