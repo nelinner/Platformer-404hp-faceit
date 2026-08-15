@@ -3,15 +3,11 @@ import os
 from datetime import datetime, timedelta
 from config import OWNER_ID
 
-# Путь к базе данных: ищем файл bot_data.db в той же директории, где лежит database.py
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.db")
-
-# Создаём соединение
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 c = conn.cursor()
 
 def init_db():
-    """Создаёт таблицы, выполняет миграции и начальные вставки."""
     c.executescript("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
@@ -28,7 +24,8 @@ def init_db():
         premium_until TEXT,
         game_ban INTEGER DEFAULT 0,
         badge TEXT DEFAULT '',
-        balance INTEGER DEFAULT 0
+        balance INTEGER DEFAULT 0,
+        coins INTEGER DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS lobbies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,14 +110,16 @@ def init_db():
         code TEXT,
         PRIMARY KEY (user_id, code)
     );
+    CREATE TABLE IF NOT EXISTS user_frames (
+        user_id INTEGER PRIMARY KEY,
+        frame_name TEXT NOT NULL
+    );
     """)
     conn.commit()
 
-    # Сбрасываем бан владельцу
     c.execute("UPDATE users SET banned_until=NULL WHERE user_id=?", (OWNER_ID,))
     conn.commit()
 
-    # Миграции (добавление отсутствующих столбцов, если потребуется)
     migrations = [
         "ALTER TABLE lobbies ADD COLUMN map_name TEXT",
         "ALTER TABLE users ADD COLUMN custom_avatar TEXT",
@@ -133,7 +132,8 @@ def init_db():
         "ALTER TABLE users ADD COLUMN game_ban INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN badge TEXT DEFAULT ''",
         "ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN premium_until TEXT"
+        "ALTER TABLE users ADD COLUMN premium_until TEXT",
+        "ALTER TABLE users ADD COLUMN coins INTEGER DEFAULT 0"
     ]
     for mig in migrations:
         try:
@@ -142,14 +142,10 @@ def init_db():
         except:
             pass
 
-    # Главный администратор
     c.execute("INSERT OR IGNORE INTO admins (username) VALUES ('nelinner')")
     conn.commit()
 
-# ------------------------------------------------------------
-# Вспомогательные функции для работы с БД
-# ------------------------------------------------------------
-
+# ---------- Все функции базы данных ----------
 def is_registered(user_id):
     c.execute("SELECT registered FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
@@ -184,7 +180,6 @@ def is_premium(user_id):
             return datetime.fromisoformat(row[0]) > datetime.now()
         except:
             pass
-    # Проверяем старый флаг premium
     c.execute("SELECT premium FROM users WHERE user_id=?", (user_id,))
     row2 = c.fetchone()
     return row2 and row2[0] == 1
@@ -286,8 +281,6 @@ def get_admin_ids():
             admin_ids.append(row[0])
     return admin_ids
 
-# ----------------- Управление лобби и матчами -----------------
-
 def get_lobbies_with_players():
     c.execute("""
         SELECT l.id, l.mode, l.thread_id, COUNT(lr.user_id)
@@ -346,8 +339,6 @@ def get_match_info(match_id):
     """, (match_id,))
     return c.fetchone()
 
-# ----------------- Функции для бейджей -----------------
-
 def get_user_badge(user_id):
     c.execute("SELECT badge FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
@@ -356,8 +347,6 @@ def get_user_badge(user_id):
 def set_user_badge(user_id, badge):
     c.execute("UPDATE users SET badge=? WHERE user_id=?", (badge, user_id))
     conn.commit()
-
-# ----------------- Функции для DUO -----------------
 
 def get_duo_partner(user_id):
     c.execute("SELECT friend_nickname FROM duos WHERE user_id=?", (user_id,))
@@ -377,8 +366,6 @@ def remove_duo(user_id):
         c.execute("DELETE FROM duos WHERE user_id=?", (user_id,))
         c.execute("DELETE FROM duos WHERE user_id IN (SELECT user_id FROM users WHERE nickname=?)", (partner_nick,))
         conn.commit()
-
-# ----------------- Функции для управления результатами -----------------
 
 def get_all_finished_matches():
     c.execute("""
@@ -419,13 +406,12 @@ def update_match_score(match_id, new_ct_score, new_t_score):
         new_elo = max(0, get_elo(uid) + delta_new)
         if is_winner_new:
             c.execute("UPDATE users SET wins = wins + 1, elo = ? WHERE user_id=?", (new_elo, uid))
+            add_coins(uid, 10)  # +10 Coins за победу
         else:
             c.execute("UPDATE users SET losses = losses + 1, elo = ? WHERE user_id=?", (new_elo, uid))
 
     conn.commit()
     return True
-
-# ----------------- Реферальная система -----------------
 
 def create_referral(invited_id, inviter_id):
     try:
@@ -462,7 +448,25 @@ def add_premium_days(user_id, days):
     c.execute("UPDATE users SET premium=1, premium_until=? WHERE user_id=?", (new_until.isoformat(), user_id))
     conn.commit()
 
-# ----------------- Промокоды -----------------
+def get_coins(user_id):
+    c.execute("SELECT coins FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else 0
+
+def add_coins(user_id, amount):
+    c.execute("UPDATE users SET coins = coins + ? WHERE user_id=?", (amount, user_id))
+    conn.commit()
+
+def get_user_frame(user_id):
+    c.execute("SELECT frame_name FROM user_frames WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else None
+
+def set_user_frame(user_id, frame_name):
+    c.execute("INSERT INTO user_frames (user_id, frame_name) VALUES (?, ?) "
+              "ON CONFLICT(user_id) DO UPDATE SET frame_name=excluded.frame_name",
+              (user_id, frame_name))
+    conn.commit()
 
 def create_promo(code, reward_type, reward_value, max_uses=1):
     c.execute("INSERT OR REPLACE INTO promocodes (code, reward_type, reward_value, max_uses) VALUES (?, ?, ?, ?)",
@@ -486,9 +490,12 @@ def use_promo(user_id, code):
     if reward_type == 'premium':
         add_premium_days(user_id, reward_value)
         message = f"Вам начислено {reward_value} дней премиума."
+    elif reward_type == 'coins':
+        add_coins(user_id, reward_value)
+        message = f"Вам начислено {reward_value} Coins."
     elif reward_type == 'balance':
-        add_balance(user_id, reward_value)
-        message = f"На ваш баланс начислено {reward_value} единиц."
+        add_coins(user_id, reward_value)
+        message = f"Вам начислено {reward_value} Coins."
     else:
         c.execute("UPDATE promocodes SET used_count = used_count - 1 WHERE code=?", (code,))
         conn.commit()
