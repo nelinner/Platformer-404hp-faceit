@@ -13,7 +13,7 @@ TOPIC_LOBBY_1x1_2 = 2
 TOPIC_DRAW = 22
 TOPIC_RESULTS = 25
 TOPIC_TICKET = 43
-TOPIC_BAN = 5974          # <-- добавлено для уведомлений о банах
+TOPIC_BAN = 5974
 
 MAX_PLAYERS = {"5x5": 10, "2x2": 4, "1x1": 2}
 
@@ -43,3 +43,5 @@ ACCENT_BLUE = (70, 140, 255)
 ACCENT_RED = (255, 70, 70)
 TEXT_WHITE = (240, 240, 245)
 TEXT_GRAY = (140, 150, 170)
+
+BOT_USERNAME = "hp404bot"   # добавлено для реферальных ссылок
