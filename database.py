@@ -3,9 +3,24 @@ import os
 from datetime import datetime, timedelta
 from config import OWNER_ID
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.db")
+# Уникальное имя файла базы данных, чтобы не пересекаться с другими ботами
+DB_FILENAME = "hp404faceit_bot.db"
+# База будет лежать в подпапке data/ рядом с database.py
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_PATH = os.environ.get("DB_PATH", os.path.join(DATA_DIR, DB_FILENAME))
+
+print(f"Используется база данных: {DB_PATH}")
+
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 c = conn.cursor()
+
+def column_exists(table, column):
+    """Проверяет, существует ли столбец в таблице."""
+    c.execute(f"PRAGMA table_info({table})")
+    return any(row[1] == column for row in c.fetchall())
 
 def init_db():
     c.executescript("""
@@ -25,7 +40,9 @@ def init_db():
         game_ban INTEGER DEFAULT 0,
         badge TEXT DEFAULT '',
         balance INTEGER DEFAULT 0,
-        coins INTEGER DEFAULT 0
+        coins INTEGER DEFAULT 0,
+        custom_avatar TEXT,
+        custom_banner TEXT
     );
     CREATE TABLE IF NOT EXISTS lobbies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,30 +134,32 @@ def init_db():
     """)
     conn.commit()
 
+    # Безопасное добавление недостающих столбцов
+    migrations = [
+        ("users", "custom_avatar", "TEXT"),
+        ("users", "custom_banner", "TEXT"),
+        ("users", "premium", "INTEGER DEFAULT 0"),
+        ("users", "wins", "INTEGER DEFAULT 0"),
+        ("users", "losses", "INTEGER DEFAULT 0"),
+        ("users", "game_ban", "INTEGER DEFAULT 0"),
+        ("users", "badge", "TEXT DEFAULT ''"),
+        ("users", "balance", "INTEGER DEFAULT 0"),
+        ("users", "premium_until", "TEXT"),
+        ("users", "coins", "INTEGER DEFAULT 0"),
+        ("lobbies", "map_name", "TEXT"),
+        ("matches", "host_id", "INTEGER"),
+        ("matches", "score", "TEXT"),
+    ]
+    for table, column, col_type in migrations:
+        if not column_exists(table, column):
+            try:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+                conn.commit()
+            except Exception as e:
+                print(f"Ошибка миграции {table}.{column}: {e}")
+
     c.execute("UPDATE users SET banned_until=NULL WHERE user_id=?", (OWNER_ID,))
     conn.commit()
-
-    migrations = [
-        "ALTER TABLE lobbies ADD COLUMN map_name TEXT",
-        "ALTER TABLE users ADD COLUMN custom_avatar TEXT",
-        "ALTER TABLE users ADD COLUMN custom_banner TEXT",
-        "ALTER TABLE matches ADD COLUMN host_id INTEGER",
-        "ALTER TABLE matches ADD COLUMN score TEXT",
-        "ALTER TABLE users ADD COLUMN premium INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN wins INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN losses INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN game_ban INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN badge TEXT DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN premium_until TEXT",
-        "ALTER TABLE users ADD COLUMN coins INTEGER DEFAULT 0"
-    ]
-    for mig in migrations:
-        try:
-            c.execute(mig)
-            conn.commit()
-        except:
-            pass
 
     c.execute("INSERT OR IGNORE INTO admins (username) VALUES ('nelinner')")
     conn.commit()
@@ -386,30 +405,34 @@ def update_match_score(match_id, new_ct_score, new_t_score):
     old_ct = int(old_score[0])
     old_t = int(old_score[1])
 
-    c.execute("UPDATE matches SET score=? WHERE id=?", (f"{new_ct_score}-{new_t_score}", match_id))
-
+    # Откат старого результата
     c.execute("SELECT user_id, team FROM match_players WHERE match_id=?", (match_id,))
     players = c.fetchall()
-
     for uid, team in players:
         is_winner_old = (team == 'CT' and old_ct > old_t) or (team == 'T' and old_t > old_ct)
         premium = is_premium(uid)
         delta_old = (50 if premium else 25) if is_winner_old else (-15 if premium else -10)
         current_elo = get_elo(uid)
-        c.execute("UPDATE users SET elo = ?, wins = CASE WHEN ? THEN wins - 1 ELSE wins END, losses = CASE WHEN ? THEN losses ELSE losses - 1 END WHERE user_id=?",
-                  (max(0, current_elo - delta_old), is_winner_old, is_winner_old, uid))
+        new_elo = max(0, current_elo - delta_old)
+        c.execute("UPDATE users SET elo=? WHERE user_id=?", (new_elo, uid))
+        if is_winner_old:
+            c.execute("UPDATE users SET wins = wins - 1 WHERE user_id=?", (uid,))
+        else:
+            c.execute("UPDATE users SET losses = losses - 1 WHERE user_id=?", (uid,))
 
+    # Применение нового результата
     for uid, team in players:
         is_winner_new = (team == 'CT' and new_ct_score > new_t_score) or (team == 'T' and new_t_score > new_ct_score)
         premium = is_premium(uid)
         delta_new = (50 if premium else 25) if is_winner_new else (-15 if premium else -10)
         new_elo = max(0, get_elo(uid) + delta_new)
+        c.execute("UPDATE users SET elo=? WHERE user_id=?", (new_elo, uid))
         if is_winner_new:
-            c.execute("UPDATE users SET wins = wins + 1, elo = ? WHERE user_id=?", (new_elo, uid))
-            add_coins(uid, 10)  # +10 Coins за победу
+            c.execute("UPDATE users SET wins = wins + 1 WHERE user_id=?", (uid,))
         else:
-            c.execute("UPDATE users SET losses = losses + 1, elo = ? WHERE user_id=?", (new_elo, uid))
+            c.execute("UPDATE users SET losses = losses + 1 WHERE user_id=?", (uid,))
 
+    c.execute("UPDATE matches SET score=? WHERE id=?", (f"{new_ct_score}-{new_t_score}", match_id))
     conn.commit()
     return True
 
@@ -498,6 +521,7 @@ def use_promo(user_id, code):
         message = f"Вам начислено {reward_value} Coins."
     else:
         c.execute("UPDATE promocodes SET used_count = used_count - 1 WHERE code=?", (code,))
+        c.execute("DELETE FROM promo_uses WHERE user_id=? AND code=?", (user_id, code))
         conn.commit()
         return False, "Неизвестный тип награды."
     conn.commit()
