@@ -363,11 +363,8 @@ def draw_player_slot(draw, x, y, w, h, user_id, elo, sid, avatar=None, banner=No
 
         draw.rounded_rectangle([x+3, y+3, x+w-3, y+h-3], radius=16, outline=(255,160,50,75), width=3)
 
-        overlay = Image.new('RGBA', (w, overlay_h))
-        for oy in range(overlay_h):
-            alpha = int(40 * (1 - oy / overlay_h))
-            for ox in range(w):
-                overlay.putpixel((ox, oy), (0,0,0,alpha))
+        # Оптимизированный оверлей
+        overlay = Image.new('RGBA', (w, overlay_h), (0,0,0,80))
         draw._image.paste(overlay, (x, y + h - overlay_h))
 
         avatar_cx = x + (avatar_r + 18)
@@ -527,7 +524,9 @@ async def generate_lobby_image(bot: Bot, lobby_id: int) -> Optional[BytesIO]:
                 font_wait = get_font(32)
                 wait_text = "WAITING\nFOR PLAYER..."
                 lines = wait_text.split('\n')
-                line_h = font_wait.size * 1.2
+                # Исправлено: расчёт высоты строки через textbbox
+                bbox = draw.textbbox((0,0), "WAITING", font=font_wait)
+                line_h = (bbox[3] - bbox[1]) * 1.2
                 total_h = len(lines) * line_h
                 cy = y + slot_h//2 - total_h//2
                 for idx, line in enumerate(lines):
@@ -676,14 +675,16 @@ async def update_lobby_post(bot: Bot, lobby_id: int):
                     chat_id=GROUP_CHAT_ID,
                     message_id=msg_id,
                     media=InputMediaPhoto(media=photo, caption=text),
-                    reply_markup=keyboard
+                    reply_markup=keyboard,
+                    message_thread_id=thread_id  # добавлено
                 )
             else:
                 await bot.edit_message_text(
                     chat_id=GROUP_CHAT_ID,
                     message_id=msg_id,
                     text=text,
-                    reply_markup=keyboard
+                    reply_markup=keyboard,
+                    message_thread_id=thread_id  # добавлено
                 )
             return
         except Exception as e:
@@ -1387,8 +1388,10 @@ async def admin_manage_map_set(query: CallbackQuery, bot: Bot):
     if not is_owner_of_menu(query):
         await query.answer("Это меню другого пользователя.", show_alert=True)
         return
-    _, _, lobby_id_str, map_name = query.data.split("_")
-    lobby_id = int(lobby_id_str)
+    # Исправлен парсинг с учетом возможных "_" в названии карты
+    parts = query.data.split("_", 3)
+    lobby_id = int(parts[2])
+    map_name = parts[3]
     c.execute("UPDATE lobbies SET map_name=? WHERE id=?", (map_name, lobby_id))
     conn.commit()
     await update_lobby_post(bot, lobby_id)
@@ -1771,9 +1774,14 @@ async def view_frame(query: CallbackQuery):
     # Отвечаем сразу, чтобы избежать "query is too old"
     await query.answer()
     try:
-        await bot.send_photo(query.message.chat.id, image_url, caption=frame_name, reply_markup=keyboard)
+        sent_msg = await bot.send_photo(query.message.chat.id, image_url, caption=frame_name, reply_markup=keyboard)
+        # Обновляем menu_messages на новое сообщение с фото
+        menu_messages[query.from_user.id] = sent_msg
     except Exception as e:
         logging.error(f"Не удалось отправить рамку: {e}")
+        # Если не удалось, отправляем текстовое сообщение с кнопкой
+        sent_msg = await bot.send_message(query.message.chat.id, frame_name, reply_markup=keyboard)
+        menu_messages[query.from_user.id] = sent_msg
     # Удаляем исходное сообщение с текстовым меню
     try:
         await bot.delete_message(chat_id=query.message.chat.id, message_id=query.message.message_id)
@@ -1808,6 +1816,7 @@ async def buy_frame(query: CallbackQuery):
         await bot.delete_message(chat_id=query.message.chat.id, message_id=query.message.message_id)
     except:
         pass
+    # Возвращаемся в магазин
     await menu_shop(query)
 
 @dp.callback_query(F.data == "shop_premium")
@@ -2298,7 +2307,7 @@ def report_keyboard(report_id: int):
         ]
     )
 
-@report_router.message(Command("report"))
+@dp.message(Command("report"))
 async def report_command(message: Message, state: FSMContext):
     args = message.text.split(maxsplit=1)
     if len(args) > 1:
@@ -2311,7 +2320,6 @@ async def report_command(message: Message, state: FSMContext):
     await state.set_state(ReportStates.waiting_target)
 
 @dp.message(ReportStates.waiting_target, F.text)
-@report_router.message(ReportStates.waiting_target, F.text)
 async def report_target(message: Message, state: FSMContext):
     target = message.text.strip().lstrip("@")
     if not target:
@@ -2322,7 +2330,6 @@ async def report_target(message: Message, state: FSMContext):
     await state.set_state(ReportStates.waiting_text)
 
 @dp.message(ReportStates.waiting_text, F.text)
-@report_router.message(ReportStates.waiting_text, F.text)
 async def report_text(message: Message, state: FSMContext, bot: Bot):
     report_text = message.text.strip()
     if not report_text:
@@ -2377,7 +2384,6 @@ async def report_text(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
 
 @dp.callback_query(ReportAction.filter())
-@report_router.callback_query(ReportAction.filter())
 async def report_callback_handler(query: CallbackQuery, callback_data: ReportAction, bot: Bot):
     try:
         member = await bot.get_chat_member(GROUP_CHAT_ID, query.from_user.id)
@@ -2556,7 +2562,7 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
     c.execute("SELECT map_name FROM lobbies WHERE id=?", (lobby_id,))
     map_name = c.fetchone()[0]
 
-    c.execute("UPDATE match_players SET team = CASE team WHEN 'CT' THEN 'T' WHEN 'T' THEN 'CT' END WHERE match_id=?", (match_id,))
+    # Убрана строка переворота команд
     c.execute("UPDATE matches SET score=?, status='finished' WHERE id=?", (f"{ct_score}-{t_score}", match_id))
     conn.commit()
 
@@ -2628,14 +2634,8 @@ async def my_lobbies(query: CallbackQuery):
 
     buttons = []
     for (match_id, lobby_id, match_num, map_name, mode, created_at) in matches:
-        c.execute("SELECT user_id FROM match_players WHERE match_id=? AND team='CT'", (match_id,))
-        ct_ids = [row[0] for row in c.fetchall()]
-        c.execute("SELECT user_id FROM match_players WHERE match_id=? AND team='T'", (match_id,))
-        t_ids = [row[0] for row in c.fetchall()]
-        ct_str = ", ".join([get_nickname(pid) for pid in ct_ids])
-        t_str = ", ".join([get_nickname(pid) for pid in t_ids])
-        text = f"Матч #{match_num} ({mode}) на {map_name}\n🔵 CT: {ct_str}\n🔴 T: {t_str}"
-        buttons.append([InlineKeyboardButton(text=text, callback_data=f"my_match_{match_id}")])
+        # Сокращённый текст кнопки
+        buttons.append([InlineKeyboardButton(text=f"Матч #{match_num} ({mode})", callback_data=f"my_match_{match_id}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="menu_back")])
     msg = await query.message.edit_text("Ваши активные матчи:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     menu_messages[user_id] = msg
