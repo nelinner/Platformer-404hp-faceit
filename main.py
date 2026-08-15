@@ -9,24 +9,17 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from math import pi, cos, sin
 from typing import Optional
-from html import escape as html_escape
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    BufferedInputFile,
-    InputMediaPhoto,
-    ChatPermissions,
+    Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    BufferedInputFile, InputMediaPhoto, ChatPermissions,
 )
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.enums import ChatMemberStatus, ParseMode
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters.callback_data import CallbackData
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
@@ -44,7 +37,6 @@ font_cache = {}
 map_images_cache = {}
 avatar_cache = {}
 banner_cache = {}
-last_report_time = {}
 menu_messages: dict[int, Message] = {}
 
 # ------------------------------------------------------------
@@ -1762,7 +1754,7 @@ async def shop_frames(query: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("view_frame_"))
 async def view_frame(query: CallbackQuery):
-    frame_key = query.data.split("_")[-1]  # gold/snow/infernal
+    frame_key = query.data.split("_")[-1]
     frames = {
         "gold": (GOLD_FRAME_IMAGE_URL, "Gold frame", GOLD_FRAME_PRICE),
         "snow": (SNOW_FRAME_IMAGE_URL, "Snow frame", SNOW_FRAME_PRICE),
@@ -1776,12 +1768,17 @@ async def view_frame(query: CallbackQuery):
         [InlineKeyboardButton(text=f"Купить за {price} Coins", callback_data=f"buy_frame_{frame_key}")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="shop_frames")],
     ])
+    # Отвечаем сразу, чтобы избежать "query is too old"
+    await query.answer()
     try:
-        await bot.send_photo(query.from_user.id, image_url, caption=frame_name, reply_markup=keyboard)
+        await bot.send_photo(query.message.chat.id, image_url, caption=frame_name, reply_markup=keyboard)
     except Exception as e:
-        await query.answer("Не удалось загрузить изображение рамки.")
-        return
-    await query.message.delete()
+        logging.error(f"Не удалось отправить рамку: {e}")
+    # Удаляем исходное сообщение с текстовым меню
+    try:
+        await bot.delete_message(chat_id=query.message.chat.id, message_id=query.message.message_id)
+    except:
+        pass
 
 @dp.callback_query(F.data.startswith("buy_frame_"))
 async def buy_frame(query: CallbackQuery):
@@ -1901,8 +1898,7 @@ async def process_promo(message: Message, state: FSMContext):
 
 # ------------------------------------------------------------
 # Остальные обработчики (пользователи, тикеты, результаты и т.д.)
-# Все они включены ниже полностью.
-
+# ------------------------------------------------------------
 @dp.callback_query(F.data == "admin_list")
 async def admin_list(query: CallbackQuery):
     if not is_owner_of_menu(query):
@@ -2972,9 +2968,13 @@ async def main():
 
         bot = Bot(token=TOKEN)
         dp.include_router(report_router)
+
+        # Сброс webhook и очистка ожидающих апдейтов
+        await bot.delete_webhook(drop_pending_updates=True)
+
         await restore_all_lobby_posts()
         asyncio.create_task(auto_reset_lobbies())
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, drop_pending_updates=True)
     finally:
         if os.path.exists(LOCK_FILE):
             os.remove(LOCK_FILE)
