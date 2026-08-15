@@ -46,7 +46,11 @@ TEXT_GRAY = (140, 150, 170)
 
 BOT_USERNAME = "hp404bot"
 
-# Цены в магазине (Coins)
+# Магазин
+GOLD_FRAME_IMAGE_URL = "https://i.ibb.co/390367fJ"
+SNOW_FRAME_IMAGE_URL = "https://i.ibb.co/PvyHhvH5"
+INFERNAL_FRAME_IMAGE_URL = "https://i.ibb.co/hFpY3nsz"
+
 GOLD_FRAME_PRICE = 100
 SNOW_FRAME_PRICE = 130
 INFERNAL_FRAME_PRICE = 150
