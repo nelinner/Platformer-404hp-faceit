@@ -2,7 +2,7 @@ import sqlite3
 import os
 import json
 from datetime import datetime, timedelta
-from config import OWNER_ID, START_MMR
+from config import OWNER_ID, START_MMR, CALIBRATION_MATCHES
 
 DB_FILENAME = "hp404faceit_bot.db"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
