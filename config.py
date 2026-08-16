@@ -1,17 +1,26 @@
 import os
 
-# Telegram bot token. Set BOT_TOKEN in the environment; never commit secrets to Git.
 TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN", "")
 GROUP_CHAT_ID = -1004345869414
-
 OWNER_ID = 6394456595
 
+# Обязательная подписка (добавлено)
+CHANNEL_USERNAME = "@your_channel"  # ЗАМЕНИТЕ НА ВАШ КАНАЛ
+
+# Топики для регистрационных постов лобби
 TOPIC_LOBBY_5x5_1 = 18
 TOPIC_LOBBY_5x5_2 = 20
 TOPIC_LOBBY_2x2_1 = 12
 TOPIC_LOBBY_2x2_2 = 13
 TOPIC_LOBBY_1x1_1 = 10
 TOPIC_LOBBY_1x1_2 = 2
+
+# Топики для ban/pick
+TOPIC_BAN_PICK = 8914
+TOPIC_REG_LOBBY_1x1 = 8930
+TOPIC_REG_LOBBY_2x2 = 8920
+TOPIC_REG_LOBBY_5x5 = 8917
+
 TOPIC_DRAW = 22
 TOPIC_RESULTS = 25
 TOPIC_TICKET = 43
@@ -48,13 +57,24 @@ TEXT_GRAY = (140, 150, 170)
 
 BOT_USERNAME = "hp404bot"
 
-# Магазин
-GOLD_FRAME_IMAGE_URL = "https://i.ibb.co/390367fJ"
-SNOW_FRAME_IMAGE_URL = "https://i.ibb.co/PvyHhvH5"
-INFERNAL_FRAME_IMAGE_URL = "https://i.ibb.co/hFpY3nsz"
+# Магазин (исправлены ссылки на прямые)
+GOLD_FRAME_IMAGE_URL = "https://i.ibb.co/ваш-код/gold.png"
+SNOW_FRAME_IMAGE_URL = "https://i.ibb.co/ваш-код/snow.png"
+INFERNAL_FRAME_IMAGE_URL = "https://i.ibb.co/ваш-код/infernal.png"
 
 GOLD_FRAME_PRICE = 100
 SNOW_FRAME_PRICE = 130
 INFERNAL_FRAME_PRICE = 150
 PREMIUM_30_DAYS_PRICE = 100
 UNBAN_PRICE = 200
+
+# Настройки калибровки LVL
+START_MMR = 1200
+CALIBRATION_MATCHES = 10
+K_CALIBRATION = 50
+K_NORMAL = 25
+K_HIGH_MMR = 20
+RD_START = 200
+RD_END = 80
+MMR_MIN = 0
+MMR_MAX = 5000
