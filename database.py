@@ -1,11 +1,10 @@
 import sqlite3
 import os
+import json
 from datetime import datetime, timedelta
-from config import OWNER_ID
+from config import OWNER_ID, START_MMR
 
-# Уникальное имя файла базы данных, чтобы не пересекаться с другими ботами
 DB_FILENAME = "hp404faceit_bot.db"
-# База будет лежать рядом с database.py
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, DB_FILENAME))
 
@@ -22,7 +21,6 @@ conn.execute("PRAGMA foreign_keys=ON")
 c = conn.cursor()
 
 def _parse_datetime(value):
-    """Parse a stored ISO timestamp safely. Returns None for invalid/empty values."""
     if not value:
         return None
     try:
@@ -31,7 +29,6 @@ def _parse_datetime(value):
         return None
 
 def column_exists(table, column):
-    """Проверяет, существует ли столбец в таблице."""
     c.execute(f"PRAGMA table_info({table})")
     return any(row[1] == column for row in c.fetchall())
 
@@ -55,7 +52,11 @@ def init_db():
         balance INTEGER DEFAULT 0,
         coins INTEGER DEFAULT 0,
         custom_avatar TEXT,
-        custom_banner TEXT
+        custom_banner TEXT,
+        mmr INTEGER DEFAULT 1200,
+        rd INTEGER DEFAULT 200,
+        calibration_matches_left INTEGER DEFAULT 10,
+        lvl INTEGER DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS lobbies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,10 +152,51 @@ def init_db():
         user_id INTEGER PRIMARY KEY,
         frame_name TEXT NOT NULL
     );
+    -- Новые таблицы
+    CREATE TABLE IF NOT EXISTS ban_pick_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        lobby_id INTEGER NOT NULL,
+        match_id INTEGER NOT NULL,
+        current_team TEXT NOT NULL DEFAULT 'CT',
+        banned_maps TEXT NOT NULL DEFAULT '[]',
+        remaining_maps TEXT NOT NULL,
+        captain_ct INTEGER NOT NULL,
+        captain_t INTEGER NOT NULL,
+        message_id INTEGER,
+        thread_id INTEGER,
+        status TEXT DEFAULT 'active',
+        final_map TEXT,
+        created_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS player_match_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        match_id TEXT NOT NULL,
+        kills INTEGER,
+        deaths INTEGER,
+        assists INTEGER,
+        score INTEGER,
+        team TEXT,
+        kd REAL,
+        confidence REAL,
+        verified INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS player_total_stats (
+        user_id INTEGER PRIMARY KEY,
+        total_matches INTEGER DEFAULT 0,
+        total_kills INTEGER DEFAULT 0,
+        total_deaths INTEGER DEFAULT 0,
+        total_assists INTEGER DEFAULT 0,
+        best_kd REAL DEFAULT 0,
+        wins INTEGER DEFAULT 0,
+        losses INTEGER DEFAULT 0,
+        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    );
     """)
     conn.commit()
 
-    # Безопасное добавление недостающих столбцов
     migrations = [
         ("users", "custom_avatar", "TEXT"),
         ("users", "custom_banner", "TEXT"),
@@ -166,6 +208,10 @@ def init_db():
         ("users", "balance", "INTEGER DEFAULT 0"),
         ("users", "premium_until", "TEXT"),
         ("users", "coins", "INTEGER DEFAULT 0"),
+        ("users", "mmr", "INTEGER DEFAULT 1200"),
+        ("users", "rd", "INTEGER DEFAULT 200"),
+        ("users", "calibration_matches_left", "INTEGER DEFAULT 10"),
+        ("users", "lvl", "INTEGER DEFAULT 1"),
         ("lobbies", "map_name", "TEXT"),
         ("matches", "host_id", "INTEGER"),
         ("matches", "score", "TEXT"),
@@ -180,11 +226,10 @@ def init_db():
 
     c.execute("UPDATE users SET banned_until=NULL WHERE user_id=?", (OWNER_ID,))
     conn.commit()
-
     c.execute("INSERT OR IGNORE INTO admins (username) VALUES ('nelinner')")
     conn.commit()
 
-# ---------- Все функции базы данных ----------
+# ---------- Функции базы данных ----------
 def is_registered(user_id):
     c.execute("SELECT registered FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
@@ -218,29 +263,19 @@ def is_premium(user_id):
     row = c.fetchone()
     if not row:
         return False
-
     premium, premium_until = row
     if premium_until:
         until = _parse_datetime(premium_until)
         if until is not None:
             active = until > datetime.now()
             if not active and premium:
-                c.execute(
-                    "UPDATE users SET premium=0 WHERE user_id=?",
-                    (user_id,),
-                )
+                c.execute("UPDATE users SET premium=0 WHERE user_id=?", (user_id,))
                 conn.commit()
             return active
-        # Invalid expiration must not grant Premium.
         if premium:
-            c.execute(
-                "UPDATE users SET premium=0 WHERE user_id=?",
-                (user_id,),
-            )
+            c.execute("UPDATE users SET premium=0 WHERE user_id=?", (user_id,))
             conn.commit()
         return False
-
-    # Legacy permanent Premium is retained only when premium_until is NULL.
     return premium == 1
 
 def get_elo(user_id):
@@ -261,7 +296,7 @@ def get_standoff_id(user_id):
 def get_user_stats(user_id):
     c.execute("SELECT elo, wins, losses FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
-    return (row[0], row[1] if row[1] else 0, row[2] if row[2] else 0) if row else (0, 0, 0)
+    return (row[0], row[1] if row[1] else 0, row[2] if row[2] else 0) if row else (0,0,0)
 
 def get_best_map(user_id):
     c.execute("SELECT map_name FROM player_maps WHERE user_id=? ORDER BY count DESC LIMIT 1", (user_id,))
@@ -279,16 +314,13 @@ def increment_map_count(user_id, map_name):
 def find_user(identifier: str):
     if identifier.startswith("@"):
         username = identifier.lstrip("@").lower()
-        if username != "nelinner":
-            c.execute("SELECT user_id FROM users WHERE username=? AND user_id != ?", (username, OWNER_ID))
-            row = c.fetchone()
-            if row:
-                return row[0]
-            return None
-        else:
-            c.execute("SELECT user_id FROM users WHERE username=?", (username,))
-            row = c.fetchone()
-            return row[0] if row else None
+        c.execute("SELECT user_id FROM users WHERE username=? AND user_id != ?", (username, OWNER_ID))
+        row = c.fetchone()
+        if row:
+            return row[0]
+        c.execute("SELECT user_id FROM users WHERE username=?", (username,))
+        row = c.fetchone()
+        return row[0] if row else None
     else:
         c.execute("SELECT user_id FROM users WHERE nickname=? AND user_id != ?", (identifier, OWNER_ID))
         row = c.fetchone()
@@ -445,7 +477,6 @@ def update_match_score(match_id, new_ct_score, new_t_score):
     old_ct = int(old_score[0])
     old_t = int(old_score[1])
 
-    # Откат старого результата
     c.execute("SELECT user_id, team FROM match_players WHERE match_id=?", (match_id,))
     players = c.fetchall()
     for uid, team in players:
@@ -460,7 +491,6 @@ def update_match_score(match_id, new_ct_score, new_t_score):
         else:
             c.execute("UPDATE users SET losses = losses - 1 WHERE user_id=?", (uid,))
 
-    # Применение нового результата
     for uid, team in players:
         is_winner_new = (team == 'CT' and new_ct_score > new_t_score) or (team == 'T' and new_t_score > new_ct_score)
         premium = is_premium(uid)
@@ -501,20 +531,15 @@ def add_balance(user_id, amount):
 def add_premium_days(user_id, days):
     if days <= 0:
         return False
-
     c.execute("SELECT premium_until FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
     now = datetime.now()
     current = _parse_datetime(row[0]) if row and row[0] else None
-
     if current is None or current < now:
         current = now
-
     new_until = current + timedelta(days=days)
-    c.execute(
-        "UPDATE users SET premium=1, premium_until=? WHERE user_id=?",
-        (new_until.isoformat(), user_id),
-    )
+    c.execute("UPDATE users SET premium=1, premium_until=? WHERE user_id=?",
+              (new_until.isoformat(), user_id))
     conn.commit()
     return True
 
@@ -547,80 +572,48 @@ def use_promo(user_id, code):
     code = code.strip().upper()
     if not code:
         return False, "Введите промокод."
-
     try:
         c.execute("BEGIN IMMEDIATE")
-        c.execute(
-            "SELECT reward_type, reward_value, max_uses, used_count "
-            "FROM promocodes WHERE code=?",
-            (code,),
-        )
+        c.execute("SELECT reward_type, reward_value, max_uses, used_count FROM promocodes WHERE code=?", (code,))
         promo = c.fetchone()
         if not promo:
             conn.rollback()
             return False, "Промокод не найден."
-
         reward_type, reward_value, max_uses, used_count = promo
         if max_uses is not None and used_count >= max_uses:
             conn.rollback()
             return False, "Промокод исчерпан."
-
-        c.execute(
-            "SELECT 1 FROM promo_uses WHERE user_id=? AND code=?",
-            (user_id, code),
-        )
+        c.execute("SELECT 1 FROM promo_uses WHERE user_id=? AND code=?", (user_id, code))
         if c.fetchone():
             conn.rollback()
             return False, "Вы уже использовали этот промокод."
-
         if reward_type == "premium":
             if reward_value <= 0:
                 conn.rollback()
                 return False, "Некорректная награда промокода."
             now = datetime.now()
-            c.execute(
-                "SELECT premium_until FROM users WHERE user_id=?",
-                (user_id,),
-            )
+            c.execute("SELECT premium_until FROM users WHERE user_id=?", (user_id,))
             row = c.fetchone()
             current = _parse_datetime(row[0]) if row and row[0] else None
             if current is None or current < now:
                 current = now
             new_until = current + timedelta(days=reward_value)
-            c.execute(
-                "UPDATE users SET premium=1, premium_until=? WHERE user_id=?",
-                (new_until.isoformat(), user_id),
-            )
+            c.execute("UPDATE users SET premium=1, premium_until=? WHERE user_id=?", (new_until.isoformat(), user_id))
             message = f"Вам начислено {reward_value} дней премиума."
         elif reward_type == "coins":
-            c.execute(
-                "UPDATE users SET coins = coins + ? WHERE user_id=?",
-                (reward_value, user_id),
-            )
+            c.execute("UPDATE users SET coins = coins + ? WHERE user_id=?", (reward_value, user_id))
             message = f"Вам начислено {reward_value} Coins."
         elif reward_type == "balance":
-            c.execute(
-                "UPDATE users SET balance = balance + ? WHERE user_id=?",
-                (reward_value, user_id),
-            )
+            c.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (reward_value, user_id))
             message = f"Вам начислено {reward_value} на баланс."
         else:
             conn.rollback()
             return False, "Неизвестный тип награды."
-
-        c.execute(
-            "UPDATE promocodes SET used_count = used_count + 1 "
-            "WHERE code=? AND (max_uses IS NULL OR used_count < max_uses)",
-            (code,),
-        )
+        c.execute("UPDATE promocodes SET used_count = used_count + 1 WHERE code=? AND (max_uses IS NULL OR used_count < max_uses)", (code,))
         if c.rowcount != 1:
             conn.rollback()
             return False, "Промокод уже исчерпан."
-
-        c.execute(
-            "INSERT INTO promo_uses (user_id, code) VALUES (?, ?)",
-            (user_id, code),
-        )
+        c.execute("INSERT INTO promo_uses (user_id, code) VALUES (?, ?)", (user_id, code))
         conn.commit()
         return True, message
     except sqlite3.IntegrityError:
@@ -629,3 +622,112 @@ def use_promo(user_id, code):
     except sqlite3.Error:
         conn.rollback()
         raise
+
+# ---------- Новые функции для калибровки LVL ----------
+def get_mmr(user_id):
+    c.execute("SELECT mmr FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else START_MMR
+
+def update_mmr(user_id, new_mmr):
+    c.execute("UPDATE users SET mmr=? WHERE user_id=?", (new_mmr, user_id))
+    conn.commit()
+
+def get_rd(user_id):
+    c.execute("SELECT rd FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else 200
+
+def update_rd(user_id, new_rd):
+    c.execute("UPDATE users SET rd=? WHERE user_id=?", (new_rd, user_id))
+    conn.commit()
+
+def get_calibration_matches_left(user_id):
+    c.execute("SELECT calibration_matches_left FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else CALIBRATION_MATCHES
+
+def decrement_calibration_matches(user_id):
+    c.execute("UPDATE users SET calibration_matches_left = calibration_matches_left - 1 WHERE user_id=? AND calibration_matches_left > 0", (user_id,))
+    conn.commit()
+
+def update_lvl_from_mmr(user_id):
+    c.execute("SELECT mmr FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    if not row:
+        return
+    mmr = row[0]
+    lvl = max(1, min(20, (mmr - 300) // 200))
+    c.execute("UPDATE users SET lvl=? WHERE user_id=?", (lvl, user_id))
+    conn.commit()
+
+def get_lvl(user_id):
+    c.execute("SELECT lvl FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else 1
+
+# ---------- Функции для ban/pick ----------
+def create_ban_pick_session(lobby_id, match_id, captain_ct, captain_t, remaining_maps, thread_id):
+    banned_maps = []
+    remaining = list(remaining_maps)
+    c.execute("""INSERT INTO ban_pick_sessions 
+                 (lobby_id, match_id, current_team, banned_maps, remaining_maps, captain_ct, captain_t, thread_id, status, created_at)
+                 VALUES (?, ?, 'CT', '[]', ?, ?, ?, ?, 'active', ?)""",
+              (lobby_id, match_id, json.dumps(remaining), captain_ct, captain_t, thread_id, datetime.now().isoformat()))
+    conn.commit()
+    return c.lastrowid
+
+def get_ban_pick_session(session_id):
+    c.execute("SELECT * FROM ban_pick_sessions WHERE id=?", (session_id,))
+    row = c.fetchone()
+    if not row:
+        return None
+    cols = [description[0] for description in c.description]
+    return dict(zip(cols, row))
+
+def update_ban_pick_session(session_id, **kwargs):
+    if not kwargs:
+        return
+    set_clause = ", ".join([f"{k}=?" for k in kwargs.keys()])
+    values = list(kwargs.values()) + [session_id]
+    c.execute(f"UPDATE ban_pick_sessions SET {set_clause} WHERE id=?", values)
+    conn.commit()
+
+def complete_ban_pick_session(session_id, final_map):
+    update_ban_pick_session(session_id, status='completed', final_map=final_map)
+
+# ---------- Функции для статистики из скриншотов ----------
+def add_match_history(user_id, match_id, kills, deaths, assists=None, score=None, team=None, kd=None, confidence=0.0):
+    c.execute("""INSERT INTO player_match_history 
+                 (user_id, match_id, kills, deaths, assists, score, team, kd, confidence)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+              (user_id, match_id, kills, deaths, assists, score, team, kd, confidence))
+    conn.commit()
+    # Обновляем агрегированную статистику
+    c.execute("SELECT * FROM player_total_stats WHERE user_id=?", (user_id,))
+    if not c.fetchone():
+        c.execute("INSERT INTO player_total_stats (user_id) VALUES (?)", (user_id,))
+    c.execute("""
+        UPDATE player_total_stats SET
+            total_matches = total_matches + 1,
+            total_kills = total_kills + ?,
+            total_deaths = total_deaths + ?,
+            total_assists = total_assists + ?,
+            best_kd = MAX(best_kd, ?),
+            wins = wins + ?,
+            losses = losses + ?
+        WHERE user_id=?
+    """, (kills, deaths, assists or 0, kd if kd else 0, 1 if team and team.startswith('CT') else 0, 1 if team and team.startswith('T') else 0, user_id))
+    conn.commit()
+
+def check_duplicate_match(match_id):
+    c.execute("SELECT 1 FROM player_match_history WHERE match_id=?", (match_id,))
+    return c.fetchone() is not None
+
+def get_player_total_stats(user_id):
+    c.execute("SELECT * FROM player_total_stats WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    if not row:
+        return None
+    cols = [description[0] for description in c.description]
+    return dict(zip(cols, row))
