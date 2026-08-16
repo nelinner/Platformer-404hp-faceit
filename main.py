@@ -664,7 +664,7 @@ async def generate_draft_image(bot, lobby_id, mode, ct_ids, t_ids, map_name, mat
     except Exception as e:
         logging.error(f"generate_draft_image error: {e}")
         return None
-        def ensure_lobby_ban_pick_column():
+        def ensure_lobby_ban_pick_column()
     try:
         c.execute("PRAGMA table_info(lobbies)")
         columns = {row[1] for row in c.fetchall()}
