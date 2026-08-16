@@ -4,7 +4,6 @@ import random
 import os
 import sys
 import requests
-import uuid
 from datetime import datetime, timedelta
 from io import BytesIO
 from math import pi, cos, sin
@@ -25,6 +24,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 from config import *
 from database import *
+from database import DB_PATH  # путь к файлу базы данных
 
 # ------------------------------------------------------------
 # Глобальные объекты
@@ -38,6 +38,9 @@ map_images_cache = {}
 avatar_cache = {}
 banner_cache = {}
 menu_messages: dict[int, Message] = {}
+
+# Прямая ссылка на изображение для тикета поддержки
+TICKET_IMAGE_URL = "https://ibb.co/BK4wJm5g"  # если не работает, замените на прямую ссылку вида i.ibb.co/....
 
 # ------------------------------------------------------------
 # Вспомогательные функции
@@ -190,12 +193,11 @@ def player_display_name(user_id):
     return nick
 
 def is_owner_of_menu(query: CallbackQuery) -> bool:
+    # Исправлено: сравниваем только чат, чтобы избежать ложных срабатываний при обновлении меню
     user_id = query.from_user.id
     if user_id not in menu_messages:
         return False
-    saved_msg = menu_messages[user_id]
-    return (query.message.message_id == saved_msg.message_id and
-            query.message.chat.id == saved_msg.chat.id)
+    return query.message.chat.id == menu_messages[user_id].chat.id
 
 # ------------------------------------------------------------
 # Генерация изображений
@@ -2209,22 +2211,38 @@ async def send_problem_report(source: Message | CallbackQuery, state: FSMContext
         f"[📃] Текст:\n{problem_text}"
     )
 
-    await bot.send_message(GROUP_CHAT_ID, report_msg, parse_mode=ParseMode.HTML, message_thread_id=TOPIC_TICKET)
+    # Отправляем в основную группу изображение тикета + текст
+    try:
+        await bot.send_photo(
+            GROUP_CHAT_ID,
+            TICKET_IMAGE_URL,
+            caption=report_msg,
+            parse_mode=ParseMode.HTML,
+            message_thread_id=TOPIC_TICKET
+        )
+    except Exception as e:
+        logging.error(f"Не удалось отправить изображение тикета в группу: {e}")
+        await bot.send_message(GROUP_CHAT_ID, report_msg, parse_mode=ParseMode.HTML, message_thread_id=TOPIC_TICKET)
 
+    # Администраторам отправляем то же изображение + текст, и отдельно скриншот пользователя (если есть)
     for admin_id in get_admin_ids():
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✉️ Ответить", callback_data=TicketAction(action="reply", ticket_id=ticket_id, user_id=user.id).pack())],
             [InlineKeyboardButton(text="🔒 Закрыть тикет", callback_data=TicketAction(action="close", ticket_id=ticket_id, user_id=user.id).pack())],
             [InlineKeyboardButton(text="✅ Отметить как решённый", callback_data=TicketAction(action="resolve", ticket_id=ticket_id, user_id=user.id).pack())],
         ])
+        try:
+            await bot.send_photo(admin_id, TICKET_IMAGE_URL, caption=report_msg, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception as e:
+            logging.error(f"Не удалось отправить изображение тикета админу {admin_id}: {e}")
+            await bot.send_message(admin_id, report_msg, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+        # Если пользователь приложил свой скриншот, отправляем его дополнительно
         if screenshot_id:
             try:
-                await bot.send_photo(admin_id, screenshot_id, caption=report_msg, parse_mode=ParseMode.HTML, reply_markup=kb)
+                await bot.send_photo(admin_id, screenshot_id, caption="📸 Скриншот от пользователя", reply_markup=kb)
             except Exception as e:
-                logging.error(f"Не удалось отправить тикет админу {admin_id}: {e}")
-                await bot.send_message(admin_id, report_msg, parse_mode=ParseMode.HTML, reply_markup=kb)
-        else:
-            await bot.send_message(admin_id, report_msg, parse_mode=ParseMode.HTML, reply_markup=kb)
+                logging.error(f"Не удалось отправить скриншот админу {admin_id}: {e}")
 
     if isinstance(source, CallbackQuery):
         await source.message.edit_text("✅ Ваше обращение отправлено. Мы скоро свяжемся с вами.")
@@ -2922,6 +2940,25 @@ async def manage_account_value(message: Message, state: FSMContext):
     else:
         await message.answer("Неизвестное действие.")
     await state.clear()
+
+# ------------------------------------------------------------
+# Экспорт базы данных
+# ------------------------------------------------------------
+@dp.message(Command("export_db"))
+async def export_db(message: Message):
+    if not is_admin(message.from_user.username):
+        await message.answer("❌ У вас нет прав.")
+        return
+    try:
+        if not os.path.exists(DB_PATH):
+            await message.answer("❌ Файл базы данных не найден.")
+            return
+        await message.answer_document(
+            open(DB_PATH, "rb"),
+            filename=os.path.basename(DB_PATH)
+        )
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка при экспорте: {e}")
 
 # ------------------------------------------------------------
 # Инициализация и восстановление
