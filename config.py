@@ -5,7 +5,7 @@ GROUP_CHAT_ID = -1004345869414
 OWNER_ID = 6394456595
 
 # Обязательная подписка (добавлено)
-CHANNEL_USERNAME = "@your_channel"  # ЗАМЕНИТЕ НА ВАШ КАНАЛ
+CHANNEL_USERNAME = "@hp404faceit"  # ЗАМЕНИТЕ НА ВАШ КАНАЛ
 
 # Топики для регистрационных постов лобби
 TOPIC_LOBBY_5x5_1 = 18
