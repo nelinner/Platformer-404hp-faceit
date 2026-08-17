@@ -6,7 +6,7 @@ from config import OWNER_ID, START_MMR, CALIBRATION_MATCHES
 
 DB_FILENAME = "hp404faceit_bot.db"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, DB_FILENAME))
+DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, DB_FILENAME))#
 
 print(f"Используется база данных: {DB_PATH}")
 
