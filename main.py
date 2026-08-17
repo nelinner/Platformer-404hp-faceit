@@ -6,6 +6,7 @@ import sys
 import requests
 import json
 import hashlib
+import re
 from datetime import datetime, timedelta
 from io import BytesIO
 from math import pi, cos, sin
@@ -23,9 +24,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.enums import ChatMemberStatus, ParseMode
 from aiogram.filters.callback_data import CallbackData
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-
-# Для OCR (раскомментируйте при необходимости)
-# import pytesseract
+import pytesseract
 
 from config import *
 from database import *
@@ -309,9 +308,7 @@ def generate_profile_card(user_id: int, username: Optional[str] = None,
         avatar_img = cached_avatar.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
         img.paste(avatar_img, (avatar_x, avatar_cy - avatar_size//2), mask)
 
-    # Рисуем значок уровня
-    draw_level_badge(draw, avatar_x + avatar_size//2, avatar_cy, avatar_size//2, user_id)
-
+    # Обводка рисуется до значка
     frame_color = FACEIT_ORANGE
     frame_width = 4
     if frame == "Gold frame":
@@ -327,6 +324,9 @@ def generate_profile_card(user_id: int, username: Optional[str] = None,
     draw.ellipse([avatar_x-5, avatar_cy-avatar_size//2-5,
                   avatar_x+avatar_size+5, avatar_cy+avatar_size//2+5],
                  outline=frame_color, width=frame_width)
+
+    # Теперь рисуем значок уровня поверх
+    draw_level_badge(draw, avatar_x + avatar_size//2, avatar_cy, avatar_size//2, user_id)
 
     try:
         font_nick = ImageFont.truetype(FONT_PATH, 34)
@@ -819,24 +819,27 @@ async def update_lobby_post(bot: Bot, lobby_id: int):
             except Exception:
                 pass
 
-    if photo:
-        msg = await bot.send_photo(
-            GROUP_CHAT_ID,
-            photo,
-            caption=caption,
-            reply_markup=keyboard,
-            message_thread_id=thread_id
-        )
-    else:
-        msg = await bot.send_message(
-            GROUP_CHAT_ID,
-            caption,
-            reply_markup=keyboard,
-            message_thread_id=thread_id
-        )
-
-    c.execute("UPDATE lobbies SET message_id=? WHERE id=?", (msg.message_id, lobby_id))
-    conn.commit()
+    # Отправляем новое сообщение с обработкой ошибок
+    try:
+        if photo:
+            msg = await bot.send_photo(
+                GROUP_CHAT_ID,
+                photo,
+                caption=caption,
+                reply_markup=keyboard,
+                message_thread_id=thread_id
+            )
+        else:
+            msg = await bot.send_message(
+                GROUP_CHAT_ID,
+                caption,
+                reply_markup=keyboard,
+                message_thread_id=thread_id
+            )
+        c.execute("UPDATE lobbies SET message_id=? WHERE id=?", (msg.message_id, lobby_id))
+        conn.commit()
+    except Exception as e:
+        logging.error(f"Не удалось отправить сообщение лобби #{lobby_id}: {e}")
 
 def get_lobby_registration_topic(mode):
     if mode == "1x1":
@@ -1207,8 +1210,8 @@ async def ban_map_callback(query: CallbackQuery, bot: Bot):
             remaining
         )
         new_keyboard = build_ban_pick_keyboard(remaining, session_id)
-        await query.message.edit_text(new_text)
-        await query.message.edit_reply_markup(reply_markup=new_keyboard)
+        # Исправление: используем один вызов edit_text с reply_markup
+        await query.message.edit_text(new_text, reply_markup=new_keyboard)
         await query.answer(f"Карта {map_name} забанена. Ход переходит к команде {next_team}.")
         await schedule_ban_pick_timer(bot, session_id, query.message.message_id, GROUP_CHAT_ID, TOPIC_BAN_PICK)
 
@@ -1216,26 +1219,38 @@ def get_lobby_mode(lobby_id):
     c.execute("SELECT mode FROM lobbies WHERE id=?", (lobby_id,))
     row = c.fetchone()
     return row[0] if row else "5x5"
+
 # ------------------------------------------------------------
-# Автосброс лобби
+# Автосброс лобби (исправленный)
 # ------------------------------------------------------------
 async def auto_reset_lobbies():
+    logging.info("🔄 Автосброс лобби запущен (каждые 15 минут)")
     while True:
-        await asyncio.sleep(15 * 60)
         try:
+            await asyncio.sleep(15 * 60)  # 15 минут
             c.execute("SELECT id FROM lobbies")
             lobbies = [row[0] for row in c.fetchall()]
             for lobby_id in lobbies:
-                c.execute("SELECT message_id FROM lobbies WHERE id=?", (lobby_id,))
-                msg_id = c.fetchone()[0]
+                # Очищаем регистрации
                 c.execute("DELETE FROM lobby_registrations WHERE lobby_id=?", (lobby_id,))
-                new_map = random.choice(list(map_images_cache.keys())) if map_images_cache else None
+                # Меняем карту на случайную
+                if map_images_cache:
+                    new_map = random.choice(list(map_images_cache.keys()))
+                else:
+                    new_map = None
                 c.execute("UPDATE lobbies SET map_name=? WHERE id=?", (new_map, lobby_id))
                 conn.commit()
+                # Обновляем пост лобби
                 await update_lobby_post(bot, lobby_id)
-            logging.info("Автосброс лобби выполнен")
+                await asyncio.sleep(1)  # небольшая пауза между лобби
+            logging.info(f"✅ Автосброс лобби выполнен. Обработано {len(lobbies)} лобби.")
+        except asyncio.CancelledError:
+            logging.info("Автосброс лобби остановлен.")
+            break
         except Exception as e:
-            logging.error(f"Ошибка в автосбросе лобби: {e}")
+            logging.error(f"❌ Ошибка в автосбросе лобби: {e}")
+            # Не прерываем цикл, продолжаем работать
+            await asyncio.sleep(5)
 
 # ------------------------------------------------------------
 # FSM, CallbackData
@@ -2982,6 +2997,44 @@ async def results_screenshot(message: Message, state: FSMContext, bot: Bot):
     await message.answer("📃 Введите счет игры (например: 13 1)")
     await state.set_state(ResultStates.waiting_score)
 
+async def process_screenshot_stats(bot: Bot, file_id: str, match_id: int):
+    """Скачивает скриншот, распознаёт никнеймы и K/D/A, сохраняет в player_match_history."""
+    try:
+        # Скачиваем файл
+        file = await bot.get_file(file_id)
+        bio = BytesIO()
+        await bot.download_file(file.file_path, bio)
+        bio.seek(0)
+
+        # Открываем изображение и применяем OCR
+        img = Image.open(bio)
+        text = pytesseract.image_to_string(img, lang='eng')  # или 'rus+eng' если нужно
+
+        # Получаем всех игроков матча
+        c.execute("SELECT user_id, nickname FROM match_players mp JOIN users u ON mp.user_id=u.user_id WHERE mp.match_id=?", (match_id,))
+        players = c.fetchall()
+
+        # Ищем строки с никами
+        for user_id, nickname in players:
+            # Ищем строку, содержащую ник (регистронезависимо)
+            pattern = re.compile(re.escape(nickname), re.IGNORECASE)
+            for line in text.splitlines():
+                if pattern.search(line):
+                    # Извлекаем числа из строки (убийства, смерти, помощи)
+                    numbers = re.findall(r'\d+', line)
+                    if len(numbers) >= 3:
+                        kills = int(numbers[0])
+                        deaths = int(numbers[1])
+                        assists = int(numbers[2])
+                        # Сохраняем в историю
+                        add_match_history(user_id, str(match_id), kills, deaths, assists)
+                        logging.info(f"Статистика для {nickname}: {kills}/{deaths}/{assists}")
+                    else:
+                        logging.warning(f"Недостаточно чисел в строке для {nickname}: {line}")
+                    break
+    except Exception as e:
+        logging.error(f"Ошибка распознавания скриншота: {e}")
+
 @dp.message(ResultStates.waiting_score, F.text)
 async def results_score(message: Message, state: FSMContext, bot: Bot):
     if is_banned(message.from_user.id): await message.answer("Вы забанены в боте."); return
@@ -3042,6 +3095,11 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
             update_lvl_from_mmr(uid)
     conn.commit()
 
+    # Анализируем скриншот для K/D
+    if screenshot_id:
+        await process_screenshot_stats(bot, screenshot_id, match_id)
+
+    # Получаем списки игроков по исходным командам
     c.execute("SELECT user_id, team FROM match_players WHERE match_id=? ORDER BY team, user_id", (match_id,))
     rows = c.fetchall()
     ct_list = [(uid, get_nickname(uid), get_elo(uid)) for uid, team in rows if team == 'CT']
@@ -3050,12 +3108,25 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
     host_id = message.from_user.id
     host_nick = get_nickname(host_id)
 
+    # Определяем победителя по исходному счёту
     if ct_score > t_score:
-        winner = "CT"
+        original_winner = "CT"
     elif t_score > ct_score:
-        winner = "T"
+        original_winner = "T"
     else:
-        winner = "Ничья"
+        original_winner = "Ничья"
+
+    # Меняем стороны для отображения
+    display_ct_list = t_list      # исходные T показываем как CT
+    display_t_list = ct_list      # исходные CT показываем как T
+
+    # Победитель по отображению
+    if original_winner == "CT":
+        display_winner = "T"
+    elif original_winner == "T":
+        display_winner = "CT"
+    else:
+        display_winner = "Ничья"
 
     result_text = (
         f"📊 РЕЗУЛЬТАТ МАТЧА\n"
@@ -3065,14 +3136,14 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🔵 CT: \n"
     )
-    for i, (uid, nick, elo) in enumerate(ct_list, 1):
+    for i, (uid, nick, elo) in enumerate(display_ct_list, 1):
         result_text += f"{i}. {nick} (ELO: {elo})\n"
     result_text += f"\n🔴 T:\n"
-    for i, (uid, nick, elo) in enumerate(t_list, 1):
+    for i, (uid, nick, elo) in enumerate(display_t_list, 1):
         result_text += f"{i}. {nick} (ELO: {elo})\n"
     result_text += (
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 Победитель: {winner}"
+        f"🏆 Победитель: {display_winner}"
     )
 
     await bot.send_photo(GROUP_CHAT_ID, screenshot_id, caption=result_text, message_thread_id=TOPIC_RESULTS)
@@ -3607,7 +3678,7 @@ async def main():
         await bot.delete_webhook(drop_pending_updates=True)
 
         await restore_all_lobby_posts()
-        asyncio.create_task(auto_reset_lobbies())
+        asyncio.create_task(auto_reset_lobbies())   # ← задача запускается здесь
         await dp.start_polling(bot)
     finally:
         release_lock()
