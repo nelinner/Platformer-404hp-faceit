@@ -206,53 +206,7 @@ def is_owner_of_menu(query: CallbackQuery) -> bool:
     return query.message.chat.id == menu_messages[user_id].chat.id
 
 # ------------------------------------------------------------
-# Функция отрисовки значка уровня
-# ------------------------------------------------------------
-def draw_level_badge(draw, cx, cy, avatar_r, user_id):
-    """Рисует кружок с уровнем игрока возле аватарки."""
-    calibration_left = get_calibration_matches_left(user_id)
-    if calibration_left > 0:
-        badge_text = "K"
-        badge_bg = (100, 100, 110, 255)
-    else:
-        lvl = get_lvl(user_id)
-        badge_text = str(lvl)
-        # Цвет в зависимости от уровня
-        if lvl >= 15:
-            badge_bg = (255, 215, 0, 255)   # золотой
-        elif lvl >= 10:
-            badge_bg = (192, 192, 192, 255) # серебро
-        elif lvl >= 5:
-            badge_bg = (205, 127, 50, 255)  # бронза
-        else:
-            badge_bg = FACEIT_ORANGE + (255,)
-
-    # Размер кружка пропорционален аватарке
-    badge_r = int(avatar_r * 0.4)
-    badge_cx = cx + avatar_r - badge_r // 2
-    badge_cy = cy + avatar_r - badge_r // 2
-
-    # Рисуем тень
-    draw.ellipse([badge_cx - badge_r - 2, badge_cy - badge_r - 2,
-                  badge_cx + badge_r + 2, badge_cy + badge_r + 2],
-                 fill=(0,0,0,150))
-    # Рисуем кружок
-    draw.ellipse([badge_cx - badge_r, badge_cy - badge_r,
-                  badge_cx + badge_r, badge_cy + badge_r],
-                 fill=badge_bg, outline=(255,255,255,200), width=2)
-
-    # Шрифт
-    font_size = max(12, int(badge_r * 1.1))
-    font = get_font(font_size)
-    text = badge_text
-    bbox = draw.textbbox((0,0), text, font=font)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
-    draw.text((badge_cx - text_w/2, badge_cy - text_h/2 - 1),
-              text, font=font, fill='white')
-
-# ------------------------------------------------------------
-# Генерация изображений
+# Генерация изображений (ИСХОДНАЯ, БЕЗ ИЗМЕНЕНИЙ)
 # ------------------------------------------------------------
 def generate_profile_card(user_id: int, username: Optional[str] = None,
                           cached_avatar: Optional[Image.Image] = None,
@@ -268,15 +222,6 @@ def generate_profile_card(user_id: int, username: Optional[str] = None,
     premium = is_premium(user_id)
     badge = get_user_badge(user_id)
     frame = get_user_frame(user_id)
-
-    # Получаем K/D из агрегированной статистики
-    c.execute("SELECT total_kills, total_deaths FROM player_total_stats WHERE user_id=?", (user_id,))
-    stats_row = c.fetchone()
-    total_kills = stats_row[0] if stats_row else 0
-    total_deaths = stats_row[1] if stats_row else 0
-    kd = total_kills / total_deaths if total_deaths > 0 else 0.0
-
-    calibration_left = get_calibration_matches_left(user_id)
 
     w, h = 800, 480
     img = Image.new("RGBA", (w, h), (0,0,0,0))
@@ -308,7 +253,6 @@ def generate_profile_card(user_id: int, username: Optional[str] = None,
         avatar_img = cached_avatar.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
         img.paste(avatar_img, (avatar_x, avatar_cy - avatar_size//2), mask)
 
-    # Обводка рисуется до значка
     frame_color = FACEIT_ORANGE
     frame_width = 4
     if frame == "Gold frame":
@@ -324,9 +268,6 @@ def generate_profile_card(user_id: int, username: Optional[str] = None,
     draw.ellipse([avatar_x-5, avatar_cy-avatar_size//2-5,
                   avatar_x+avatar_size+5, avatar_cy+avatar_size//2+5],
                  outline=frame_color, width=frame_width)
-
-    # Теперь рисуем значок уровня поверх
-    draw_level_badge(draw, avatar_x + avatar_size//2, avatar_cy, avatar_size//2, user_id)
 
     try:
         font_nick = ImageFont.truetype(FONT_PATH, 34)
@@ -362,18 +303,9 @@ def generate_profile_card(user_id: int, username: Optional[str] = None,
     draw.text((stat_x, stat_y+40), f"Матчей сыграно: {total}", font=font_small, fill=TEXT_GRAY)
     draw.text((stat_x, stat_y+65), f"Побед: {wins}", font=font_small, fill=TEXT_GRAY)
     draw.text((stat_x, stat_y+90), f"Поражений: {losses}", font=font_small, fill=TEXT_GRAY)
-    draw.text((stat_x, stat_y+115), f"K/D: {kd:.2f}", font=font_small, fill=TEXT_GRAY)
-
-    # Уровень и MMR
-    if calibration_left > 0:
-        draw.text((stat_x, stat_y+145), f"Калибровка: осталось {calibration_left} матчей", font=font_small, fill=GOLD)
-    else:
-        lvl = get_lvl(user_id)
-        mmr = get_mmr(user_id)
-        draw.text((stat_x, stat_y+145), f"LVL: {lvl} | MMR: {mmr}", font=font_small, fill=GOLD)
 
     bar_x = stat_x
-    bar_y = stat_y + 175
+    bar_y = stat_y + 120
     bar_w = 200
     bar_h = 14
     draw.rounded_rectangle([bar_x, bar_y, bar_x+bar_w, bar_y+bar_h], radius=7, fill=(60,60,70))
@@ -456,9 +388,6 @@ def draw_player_slot(draw, x, y, w, h, user_id, elo, sid, avatar=None, banner=No
             draw.ellipse([avatar_cx-avatar_r, avatar_cy-avatar_r,
                           avatar_cx+avatar_r, avatar_cy+avatar_r],
                          fill=(35,38,55), outline=FACEIT_ORANGE, width=3)
-
-        # Рисуем значок уровня
-        draw_level_badge(draw, avatar_cx, avatar_cy, avatar_r, user_id)
 
         if show_username:
             display_name = player_display_name(user_id)
@@ -1210,7 +1139,7 @@ async def ban_map_callback(query: CallbackQuery, bot: Bot):
             remaining
         )
         new_keyboard = build_ban_pick_keyboard(remaining, session_id)
-        # Исправление: используем один вызов edit_text с reply_markup
+        # Один вызов edit_message_text с reply_markup, чтобы клавиатура обновилась
         await query.message.edit_text(new_text, reply_markup=new_keyboard)
         await query.answer(f"Карта {map_name} забанена. Ход переходит к команде {next_team}.")
         await schedule_ban_pick_timer(bot, session_id, query.message.message_id, GROUP_CHAT_ID, TOPIC_BAN_PICK)
@@ -1421,35 +1350,16 @@ async def profile(query: CallbackQuery, bot: Bot):
     total = wins + losses
     winrate = (wins / total * 100) if total > 0 else 0
     coins = get_coins(user_id)
-    mmr = get_mmr(user_id)
-    lvl = get_lvl(user_id)
-
-    # K/D
-    c.execute("SELECT total_kills, total_deaths FROM player_total_stats WHERE user_id=?", (user_id,))
-    stats_row = c.fetchone()
-    total_kills = stats_row[0] if stats_row else 0
-    total_deaths = stats_row[1] if stats_row else 0
-    kd = total_kills / total_deaths if total_deaths > 0 else 0.0
-
-    calibration_left = get_calibration_matches_left(user_id)
-
     info_text = (
         f"ℹ️ Информация об игроке:\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"[👤] Nickname: {nick}\n"
         f"[🪪] ID: {sid}\n"
         f"[💲] Coins: {coins}\n"
-    )
-    if calibration_left > 0:
-        info_text += f"[🎯] Калибровка: осталось {calibration_left} матчей\n"
-    else:
-        info_text += f"[🎯] LVL: {lvl} (MMR: {mmr})\n"
-    info_text += (
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"[⚡] Сыграно матчей: {total}\n"
         f"[🏆] Victory: {wins} ({winrate:.1f}%)\n"
-        f"[❌] Defeat: {losses}\n"
-        f"[🎯] K/D: {kd:.2f}"
+        f"[❌] Defeat: {losses}"
     )
     cached_av = await get_avatar_image_cached(bot, user_id)
     cached_bn = await get_banner_cached(bot, user_id)
@@ -3099,7 +3009,7 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
     if screenshot_id:
         await process_screenshot_stats(bot, screenshot_id, match_id)
 
-    # Получаем списки игроков по исходным командам
+    # Получаем списки игроков по исходным командам (без смены сторон)
     c.execute("SELECT user_id, team FROM match_players WHERE match_id=? ORDER BY team, user_id", (match_id,))
     rows = c.fetchall()
     ct_list = [(uid, get_nickname(uid), get_elo(uid)) for uid, team in rows if team == 'CT']
@@ -3108,25 +3018,12 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
     host_id = message.from_user.id
     host_nick = get_nickname(host_id)
 
-    # Определяем победителя по исходному счёту
     if ct_score > t_score:
-        original_winner = "CT"
+        winner = "CT"
     elif t_score > ct_score:
-        original_winner = "T"
+        winner = "T"
     else:
-        original_winner = "Ничья"
-
-    # Меняем стороны для отображения
-    display_ct_list = t_list      # исходные T показываем как CT
-    display_t_list = ct_list      # исходные CT показываем как T
-
-    # Победитель по отображению
-    if original_winner == "CT":
-        display_winner = "T"
-    elif original_winner == "T":
-        display_winner = "CT"
-    else:
-        display_winner = "Ничья"
+        winner = "Ничья"
 
     result_text = (
         f"📊 РЕЗУЛЬТАТ МАТЧА\n"
@@ -3136,14 +3033,14 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🔵 CT: \n"
     )
-    for i, (uid, nick, elo) in enumerate(display_ct_list, 1):
+    for i, (uid, nick, elo) in enumerate(ct_list, 1):
         result_text += f"{i}. {nick} (ELO: {elo})\n"
     result_text += f"\n🔴 T:\n"
-    for i, (uid, nick, elo) in enumerate(display_t_list, 1):
+    for i, (uid, nick, elo) in enumerate(t_list, 1):
         result_text += f"{i}. {nick} (ELO: {elo})\n"
     result_text += (
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 Победитель: {display_winner}"
+        f"🏆 Победитель: {winner}"
     )
 
     await bot.send_photo(GROUP_CHAT_ID, screenshot_id, caption=result_text, message_thread_id=TOPIC_RESULTS)
